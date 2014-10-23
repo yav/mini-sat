@@ -316,11 +316,12 @@ solSetTrue l impliedBy S { .. } =
   case assignGetLit l sAssignment of
     Just True  -> Just (False, S { .. }) -- Already known to be true
     Just False -> Nothing                -- Already known to be false
-    Nothing -> Just (True, S
-      { sAssignment = assignSetLit l impliedBy sDecisionLevel sAssignment
-      -- , sPropagate  = sPropagate |> l
-      , ..
-      })
+    Nothing -> Just 
+      ( True
+      , S { sAssignment = assignSetLit l impliedBy sDecisionLevel sAssignment
+          , ..
+          }
+      )
 
 
 
