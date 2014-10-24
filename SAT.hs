@@ -5,6 +5,7 @@ module SAT where
 
 import qualified Data.Map as Map
 import           Data.Map ( Map )
+import           Data.Set ( Set )
 import qualified Data.Set as Set
 import           Data.Sequence (Seq, ViewL(..), (|>), (><))
 import qualified Data.Sequence as Seq
@@ -72,8 +73,12 @@ claFindLit isOk (Cla mp) = listToMaybe $ filter (isOk . litVar) $ Arr.elems mp
 
 -- | If the clause is the reason for the literal to become true,
 -- then all other literals must have been false.
-claReason :: Literal -> Clause -> [Literal]
-claReason l (Cla mp) = [ litNeg l1 | l1 <- Arr.elems mp, l1 /= l ]
+claReasonFor :: Literal -> Clause -> [Literal]
+claReasonFor l (Cla mp) = [ litNeg l1 | l1 <- Arr.elems mp, l1 /= l ]
+
+-- | If the clause became false, then all its literals must be false.
+claReason :: Clause -> [Literal]
+claReason (Cla mp) = [ litNeg l | l <- Arr.elems mp ]
 
 
 
@@ -84,11 +89,16 @@ claReason l (Cla mp) = [ litNeg l1 | l1 <- Arr.elems mp, l1 /= l ]
 -- | An assignment keeps track of the current values for variables,
 -- also keeping track with how these assignments came to be.
 data Assignment = Assignment
-  { assignVars  :: Map Variable AssignInfo
+  { assignVars  :: !(Map Variable AssignInfo)
     -- ^ Bindings for variables, with information about how they came to be.
 
-  , assignTrace :: [Literal]
+  , assignTrace :: [[Literal]]
     -- ^ The order in which we assigned the variables (most recent first).
+    -- The literals are grouped by decision level.
+
+  , assignDecisionLevel :: !Int
+    -- ^ The current decision level, which should match the length of
+    -- 'assignTrace'.
   }
 
 -- | Information for a single variable.
@@ -119,30 +129,57 @@ assignGetLevel x Assignment { .. } =
 -- | Record the fact that the literal became true.
 assignSetLit :: Literal         -- ^ This lieteral became true
              -> Maybe Clause    -- ^ Implied by a clause
-             -> Int             -- ^ Decision level
              -> Assignment      -- ^ Assignment to modify.
              -> Assignment
-assignSetLit l assignImpliedBy assignAtLevel Assignment { .. } =
-  Assignment { assignVars = Map.insert (litVar l)
-                                       AssignInfo { assignValue = litIsPos l
-                                                  , .. }
-                                       assignVars
-             , assignTrace = l : assignTrace
+assignSetLit l assignImpliedBy Assignment { .. } =
+  Assignment { assignVars  = Map.insert (litVar l) info assignVars
+             , assignTrace = case assignTrace of
+                               -- No need to record top-level assignments.
+                               []        -> []
+                               ls : more -> (l : ls) : more
+             , ..
              }
+  where
+  info = AssignInfo { assignValue = litIsPos l
+                    , assignAtLevel = assignDecisionLevel
+                    , .. }
 
--- | Undo last assignment, if any.  Returns that literal that became true,
--- information about what caused the assignment, and the modified assignment.
-assignUndoLast :: Assignment -> Maybe (Literal, AssignInfo, Assignment)
+{- | Undo last assignment in the current decision level, if any.
+Returns that literal that became true, information about what caused
+the assignment, and the modified assignment.
+PRE: This is called only when there is something to undo
+      (i.e., level is > 0, and there is at least one decision) -}
+assignUndoLast :: Assignment -> (Literal, AssignInfo, Assignment)
 assignUndoLast Assignment { .. } =
   case assignTrace of
-    []     -> Nothing
-    l : ls ->
+    (l : ls) : lss ->
       case Map.updateLookupWithKey (\_ _ -> Nothing) (litVar l) assignVars of
-        (Just i, mp1) -> Just (l, i, Assignment { assignVars = mp1
-                                                , assignTrace = ls } )
-        _ -> error "[BUG] Unbound variable in assignment trace."
+        (Just i, mp1) -> (l, i, Assignment { assignVars = mp1
+                                           , assignTrace = ls : lss
+                                           , ..
+                                           } )
+        _ -> panic "Unbound variable in assignment trace."
+    _ -> panic "Tried to undo a non-existent assignment."
 
 
+
+-- | Undo the assignments in the top-most decision level.
+-- PRE: We are not at level 0.
+assignCancel :: Assignment -> Assignment
+assignCancel Assignment { .. } =
+  case assignTrace of
+    ls : more -> Assignment
+                  { assignVars = foldr Map.delete assignVars (map litVar ls)
+                  , assignTrace = more
+                  , assignDecisionLevel = assignDecisionLevel - 1
+                  }
+    [] -> panic "Tried to `assignCancel` at the top-level."
+
+-- | Cancel assignments until we are at the specified decsion level.
+assignCancelTill :: Int -> Assignment -> Assignment
+assignCancelTill lvl a
+  | assignDecisionLevel a > lvl = assignCancelTill lvl (assignCancel a)
+  | otherwise                   = a
 
 --------------------------------------------------------------------------------
 -- Watch Lists
@@ -194,7 +231,7 @@ watchGetClauses l Watchers { .. } =
   where
   otherLit WCla { .. } =
     case Map.lookup watchedId watched of
-      Nothing      -> error "[BUG] Missing watched pair."
+      Nothing      -> panic "Missing watched pair."
       Just (l1,l2) -> if l == l1 then l2 else l1
 
 
@@ -230,8 +267,6 @@ data S = S
   , sWatching       :: Watchers
     -- ^ For each literal, we remember whom to notify when it becomes true.
 
-  , sDecisionLevel  :: !Int
-    -- ^ Current decision level: 0 means top-level (i.e., no guesses)
   }
 
 
@@ -277,8 +312,7 @@ data ExamResult = Conflict | NewWork | Done
 
 {- | Examine the clause, in light of the literal becoming true.
 The clause should re-inesert itself in the watchers datastructure.
-The boolean indicates if we found a conflict.
--}
+The boolean indicates if we found a conflict. -}
 solExamineClause :: Literal -> (WatchedClause, Literal) -> S -> (ExamResult, S)
 solExamineClause l it@(cla, otherLit) S { .. } =
 
@@ -307,85 +341,132 @@ solExamineClause l it@(cla, otherLit) S { .. } =
   newUnbound x = x /= x1 && x2 /= x2 && not (assignDefines x sAssignment)
 
 
--- | Set a literal to true in the given state.
--- Fails, if doing so results in a conflict.
--- On sucess, we return a boolean flag, indicating if more work needs to
--- be propagated, and the new state.
+{- | Set a literal to true in the given state.
+Fails, if doing so results in a conflict.
+On sucess, we return a boolean flag, indicating if more work needs to
+be propagated, and the new state. -}
 solSetTrue :: Literal -> Maybe Clause -> S -> Maybe (Bool, S)
 solSetTrue l impliedBy S { .. } =
   case assignGetLit l sAssignment of
     Just True  -> Just (False, S { .. }) -- Already known to be true
     Just False -> Nothing                -- Already known to be false
-    Nothing -> Just 
-      ( True
-      , S { sAssignment = assignSetLit l impliedBy sDecisionLevel sAssignment
-          , ..
-          }
-      )
+    Nothing -> Just (True, S { sAssignment = newA, .. })
+      where newA = assignSetLit l impliedBy sAssignment
 
 
 
+--------------------------------------------------------------------------------
+-- Backtracking
+--------------------------------------------------------------------------------
 
-{-
-{- | Analyze a conflict clause.
-Returns a new learned clause, and how far to backtrack.
 
-The state is modified because in the process of analyzing the clause,
-we get started on the backtracking.
+
+-- | The state used while analyzigin a conflict clause.
+data AnaS = AnaS { asAssign :: !Assignment
+                   -- ^ Assignment, slowly being backtracked.
+
+                 , asSeen   :: !(Set Variable)
+                   -- ^ Set of processed variables.
+
+                 , asUndo   :: !Int
+                   -- ^ How many literals at the current level need undoing.
+
+                 , asLearn  :: [Literal]
+                   -- ^ Learned clause
+
+                 , asMaxLvl :: !Int
+                   -- ^ Maximum decision level for literals in learned clause.
+
+                 , asMaxLvlLit :: Maybe Literal
+                   -- ^ Literal with maximum decision level.
+                   -- This is used as the second literal to watch in
+                   -- the learnt clause.
+                 }
+
+
+{- | Analyze a conflict clause and back-track.
+Returns a ( new learned clause
+          , a literal in the clause to watch
+          , a second literal in the clause to waty (if any)
+          , new backtracked assignemnt
+          )
 
 Assumes that we are not at decision level 0.
 -}
-{-
-analyzeConflict :: Clause -> S -> ((Clause, Int), S)
-analyzeConflict confl S { .. } = undefined
-  -- XXX: Remember to negate the literals!
+
+analyzeConflict :: Clause -> S -> (Clause, Literal, Maybe Literal, Assignment)
+analyzeConflict confl S { .. } = checkReason s0 (claReason confl)
+
   where
+  s0 = AnaS { asAssign    = sAssignment
+            , asSeen      = Set.empty
+            , asUndo      = 0
+            , asLearn     = []
+            , asMaxLvl    = 0
+            , asMaxLvlLit = Nothing
+            }
 
-  checkReason agn seen toUndo learn maxLvl [] =
+  checkReason s [] = undoRelevantOne s
 
-  checkReason agn seen toUndo learn maxLvl (l : ls)
-    | x `Set.member` ls     =
-      checkReason agn seen  toUndo       learn            maxLvl           ls
+  checkReason AnaS { .. } (l : ls) =
+                            checkReason s1 { asSeen = Set.insert x asSeen } ls
+    where
+    x        = litVar l
+    Just lvl = assignGetLevel x asAssign
 
-    | lvl == sDecisionLevel =
-      checkReason agn seen1 (toUndo + 1) learn            maxLvl           ls
+    s1 -- We've already processed this literal: do nothing.
+      | x `Set.member` asSeen = AnaS { .. }
 
-    | lvl > 0               =
-      checkReason agn seen1 toUndo       (claOr' l learn) (max maxLvl lvl) ls
+      -- A literal at the current decision level: increment the number of
+      -- literals that need undoing.
+      | lvl == assignDecisionLevel asAssign = AnaS { asUndo = 1 + asUndo, .. }
 
-    | otherwise             =
-      checkReason agn seen1 toUndo       learn            maxLvl           ls
--}
-{-
-data ReasonAction = Undo | Learn | Ignore
+      -- A literal that was assigned as a guess at a previous level:
+      -- add to the learned clause, and update the max. decision level.
+      | lvl > 0 = if lvl > asMaxLvl
+                     then AnaS { asLearn     = l : asLearn
+                               , asMaxLvl    = lvl
+                               , asMaxLvlLit = Just l
+                               , .. }
+                     else AnaS { asLearn = l : asLearn, .. }
 
-analyzeReason curDecisionLvl seen =
-  go [] 0 0 $ nub $ filter (not . isKnown) ls
-
-  in 
-  where
-  isKnown l = litVar l `Set.member` seen
-
-
-  go agn seen learn maxLvl toUndo [] =
-
-
-  go agn seen learn maxLvl toUndo (l : ls) =
-    case analyzeReasonLit agn curDecisionLvl l of
-      Undo      -> go agn seen learn       maxLvl           (1 + toUndo) ls
-      Learn lvl -> go agn seen (l : learn) (max maxLvl lvl) toUndo       ls
-      Ignore    -> go agn seen learn       maxLvl           toUndo       ls
+      -- A literal that was assigned at level 0: can't expand any further.
+      | otherwise = AnaS { .. }
 
 
-analyzeReasonLit agn curDecisionLvl l
-  | lvl == curDecisionLvl = Undo
-  | lvl > 0               = Learn lvl
-  | otherwise             = Ignore
-  where
-  x     = litVar l
-  lvl   = case assignGetLevel x agn of
-            Just n -> n
-            Nothing -> error "[BUG] Conflict literal with no level"
--}
+  undoRelevantOne AnaS { .. } =
+    case assignUndoLast asAssign of
+      (l, ai, agn1)
 
--}
+        -- Some other irrelevant variable?
+        | not (litVar l `Set.member` asSeen) ->
+          undoRelevantOne AnaS { asAssign = agn1, .. }
+
+        -- Is this the last one?
+        | asUndo == 1 ->
+          let newL = litNeg l
+          in case claFromList (litNeg l : asLearn) of
+               Just cla -> ( cla
+                           , newL, asMaxLvlLit
+                           , assignCancelTill asMaxLvl asAssign
+                           )
+               Nothing  -> panic "Trivial learned clause?"
+
+        -- Let's investigate the reason for the assignment.
+        | otherwise ->
+          case assignImpliedBy ai of
+            Nothing  -> panic "Undoing a non-implied assignment."
+            Just cla -> checkReason
+                          AnaS { asAssign = agn1
+                               , asUndo   = asUndo -1
+                               , .. }
+                          (claReasonFor l cla)
+
+--------------------------------------------------------------------------------
+-- Misc
+--------------------------------------------------------------------------------
+
+panic :: String -> a
+panic msg = error ("[BUG] " ++ msg)
+
+
