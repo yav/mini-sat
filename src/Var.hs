@@ -1,5 +1,4 @@
-{-# LANGUAGE Trustworthy #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}  -- For unboxed arrays of literals
+{-# LANGUAGE Safe #-}
 
 -- | Variables and Literals
 module Var
@@ -7,16 +6,15 @@ module Var
     Variable, var
 
     -- * Literals
-  , Literal, lit, litNeg, litVar, litIsPos
+  , Literal(..), lit, litNeg, litVar, litIsPos
   ) where
-
-import           Data.Array.Unboxed ( IArray, UArray )
 
 newtype Variable    = Var Int
                       deriving (Eq,Ord,Show,Read)
 
 newtype Literal     = Lit Int
-                      deriving (Eq,Ord,Show,Read,IArray UArray)
+                      deriving (Eq,Ord,Show,Read)
+
 
 -- | Create a new variable.  Variables should be strictly positive.
 var :: Int -> Maybe Variable
