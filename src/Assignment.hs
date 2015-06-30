@@ -24,8 +24,8 @@ import qualified Data.Map as Map
 import           Data.Map ( Map )
 
 
--- | An assignment keeps track of the current values for variables,
--- also keeping track with how these assignments came to be.
+-- | An assignment keeps track of the current values for variables.
+-- In addition, it keeps track of how these assignments came to be.
 data Assignment = Assignment
   { assignVars  :: !(Map Variable AssignInfo)
     -- ^ Bindings for variables, with information about how they came to be.
