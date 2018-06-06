@@ -1,12 +1,11 @@
 module SAT where
 
-import Data.Map(Map)
-import qualified Data.Map as Map
+import           Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
-import qualified Data.Set as Set
+import           Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 import qualified Data.List as List
-import Data.Maybe(mapMaybe)
+import Data.Maybe(mapMaybe,listToMaybe,fromMaybe)
 import Data.Foldable(toList)
 import Control.Monad(foldM)
 
@@ -20,14 +19,15 @@ import Debug.Trace
 
 solver :: Ersatz.Solver Ersatz.SAT IO
 solver (Ersatz.SAT n f _) =
-  do print n
+  do putStrLn ("Variables: " ++ show n)
      case check (mapMaybe toCl (toList (Ersatz.formulaSet f))) of
        Nothing -> return (Ersatz.Unsatisfied, IntMap.empty)
-       Just xs -> do print xs
-                     return ( Ersatz.Satisfied, IntMap.fromList (Map.toList xs))
+       Just xs -> return ( Ersatz.Satisfied
+                         , IntMap.fromList (IntMap.toList (fst <$> xs))
+                         )
   where
   toCl :: Ersatz.Clause -> Maybe Clause
-  toCl cl = traverse one $ Map.fromListWith (++)
+  toCl cl = traverse one $ IntMap.fromListWith (++)
               [ (abs x, [if x > 0 then Pos else Neg])
                       | x <- IntSet.toList (Ersatz.clauseSet cl) ]
 
@@ -39,7 +39,8 @@ data Polarity = Neg | Pos deriving (Eq,Ord,Show)
 data Lit      = Lit { litPolarity :: Polarity, litVar :: Var }
                   deriving Show
 
-type Assignment = Map Var Bool
+type Assignment = IntMap {-Var-} (Bool, Reason)
+type Reason     = IntSet {-Guess-}
 
 polarity :: Polarity -> Bool -> Bool
 polarity p = case p of
@@ -48,18 +49,27 @@ polarity p = case p of
 
 -- | The value of a varible in the given assignment, if any.
 lookupVar :: Var -> Assignment -> Maybe Bool
-lookupVar = Map.lookup
+lookupVar v a = fst <$> IntMap.lookup v a
 
-type Clause = Map Var Polarity
+lookupReason :: Var -> Assignment -> Reason
+lookupReason v a =
+  case IntMap.lookup v a of
+    Just (_,r) -> r
+    Nothing    -> error ("Variable " ++ show v ++ " is not assigned")
+
+type Clause = IntMap {-Var-} Polarity
 
 -- | Nothing means that not all variables were defined.
 evalClause :: Assignment -> Clause -> Maybe Bool
-evalClause agn cs = or <$> mapM ev (Map.toList cs)
+evalClause agn cs = or <$> mapM ev (IntMap.toList cs)
   where ev (x,p) = polarity p <$> lookupVar x agn
 
 
 polarityOf :: Var -> Clause -> Polarity
-polarityOf x c = c Map.! x
+polarityOf x c =
+  case IntMap.lookup x c of
+    Just a -> a
+    Nothing -> error $ "Variable " ++ show x ++ " is not in " ++ show c
 
 
 data Clause1  = Clause1 Var     Clause deriving Show
@@ -69,23 +79,40 @@ type ClauseId = Int
 data State = State
   { assigned    :: Assignment
   , unassigned  :: [Var]
-  , monitored   :: Map Var [ClauseId]
-  , incomplete  :: Map ClauseId Clause2
+  , monitored   :: IntMap {-Var-} [ClauseId]
+  , nextCid     :: Int
+  , incomplete  :: IntMap {-ClauseId-} Clause2
   , guesses     :: [(Var,State)]
   } deriving Show
+
+newClause2 :: Clause2 -> State -> State
+newClause2 w@(Clause2 x y c) s =
+  trace ("Adding learned clause" ++ show c) $
+  add s { guesses = [ (x, add s1) | (x,s1) <- guesses s ] }
+  where
+  cid = nextCid s
+
+  add s1 = s1 { incomplete = IntMap.insertWith (error "bug") cid w (incomplete s1)
+              , monitored  = IntMap.insertWith (++) x [cid]
+                           $ IntMap.insertWith (++) y [cid]
+                           $ monitored s1
+
+              , nextCid = cid + 1
+              }
 
 
 check :: [Clause] -> Maybe Assignment
 check cs =
-  do (vs, c1,c2) <- foldM preProc (Set.empty, [],[]) cs
+  do (vs, c1,c2) <- foldM preProc (IntSet.empty, [],[]) cs
      let inc = zip [ 0 .. ] c2 :: [(Int,Clause2)]
-         s   = State { assigned   = Map.empty
-                     , unassigned = 7 : 2 : [ x | x <- Set.toList vs, x /= 2 && x /= 7 ]
-                     , monitored  = Map.fromListWith (++)
+         s   = State { assigned   = IntMap.empty
+                     , unassigned = IntSet.toList vs
+                     , monitored  = IntMap.fromListWith (++)
                                       [ v | (i, Clause2 x y _) <- inc
                                           , v <- [ (x,[i]), (y,[i]) ]
                                       ]
-                     , incomplete = Map.fromList inc
+                     , nextCid    = length inc
+                     , incomplete = IntMap.fromList inc
                      , guesses    = []
                      }
      sln <- checkSat c1 s
@@ -101,12 +128,21 @@ check cs =
 
 
   where
-  preProc (vs,c1,c2) c =
-    do let vs1 = Set.union (Map.keysSet c) vs
-       ((x,_),rest) <- Map.minViewWithKey c
-       case Map.minViewWithKey rest of
-         Nothing    -> return (vs1, Clause1 x c : c1, c2)
-         Just ((y,_),_) -> return (vs1, c1, Clause2 x y c : c2)
+  preProc (vs,c1s,c2s) c =
+    do let vs1 = IntSet.union (IntMap.keysSet c) vs
+       ty <- importClause c
+       case ty of
+         Left c1 -> return (vs1, c1 : c1s, c2s)
+         Right c2 -> return (vs1, c1s, c2 : c2s)
+
+importClause :: Clause -> Maybe (Either Clause1 Clause2)
+importClause c =
+  do ((x,_),rest) <- IntMap.minViewWithKey c
+     case IntMap.minViewWithKey rest of
+       Nothing        -> return $ Left (Clause1 x c)
+       Just ((y,_),_) -> return $ Right (Clause2 x y c)
+
+
 
 
 checkSat :: [Clause1] -> State -> Maybe Assignment
@@ -114,84 +150,108 @@ checkSat sing s =
   case sing of
     []  -> guess s
     Clause1 x c : more ->
-      case lookupVar x (assigned s) of
+      case lookupVar x agn of
         Just b
           | polarity p b -> checkSat more s
-          | otherwise    -> backtrack s
-        Nothing -> let v = polarity p True
-                   in setVar more x v s
+          | otherwise    -> backtrack s c
+        Nothing ->
+          -- trace ("Propagating: " ++ show x ++ ", clause: " ++ show c ++ ", reason: " ++ show reason) $
+          setVar more reason x val s
       where
-      p = polarityOf x c
+      agn     = assigned s
+      p       = polarityOf x c
+      val     = polarity p True
+      reason  = IntSet.unions
+                    [ lookupReason v agn | (v,p) <- IntMap.toList c
+                    , v /= x
+                    ]
 
-
-backtrack :: State -> Maybe Assignment
-backtrack s =
-  case guesses s of
+backtrack :: State -> Clause -> Maybe Assignment
+backtrack s c =
+  case dropWhile notRelevant (guesses s) of
     [] -> Nothing
-    (x,s1) : _ -> checkSat [Clause1 x learn] s1
+    (x,s1) : more ->
+      -- trace ("backtracking: " ++ show (x,reasons)) $
+      let (nonrs,rs) = span notRelevant more
+          c1 = Clause1 x learn
+          st = case map snd nonrs of
+                 [] -> s1
+                 ss -> last ss
+      in case map fst rs of
+           [] -> checkSat [c1] st
+           y : _ -> let w2 = Clause2 x y learn
+                    in checkSat [c1] (newClause2 w2 st)
   where
-  learn = Map.fromList [ (x,Neg) | (x,_) <- guesses s ]
+  reasons = IntSet.unions (map (`lookupReason` assigned s) (IntMap.keys c))
+  learn   = IntMap.fromList [ (v,Neg) | v <- IntSet.toList reasons ]
+  notRelevant (x,_) = not (x `IntMap.member` learn)
+
 
 
 
 guess :: State -> Maybe Assignment
 guess s =
   case unassigned s of
-    x : _ -> setVar [] x True s { guesses = (x,s) : guesses s }
+    x : _ -> -- trace ("Guessing " ++ show x ++ " to be True") $
+             setVar [] (IntSet.singleton x)
+                       x True s { guesses = (x,s) : guesses s }
     []    -> return (assigned s)
 
 
-setVar :: [Clause1] -> Var -> Bool -> State -> Maybe Assignment
-setVar sing v b s0 =
-  let s = s0 { assigned   = Map.insert v b (assigned s0)
+setVar :: [Clause1] -> Reason -> Var -> Bool -> State -> Maybe Assignment
+setVar sing reason v b s0 =
+  {-trace ("Setting " ++ show v ++ " to " ++ show b ++ " forced by gusses: " ++ show reason)
+  $ -}
+  -- trace ("Last guess: " ++ show (listToMaybe (map fst (guesses s0)))) $
+  let s = s0 { assigned   = IntMap.insert v (b,reason) (assigned s0)
              , unassigned = List.delete v (unassigned s0)
              }
   in
-  case Map.lookup v (monitored s) of
+  case IntMap.lookup v (monitored s) of
     Nothing -> checkSat sing s
     Just xs ->
       case updClauses v b s xs of
-        (sings,s1) -> checkSat (sings ++ sing) s1   -- does order matter?
+        Left c -> backtrack s c
+        Right (sings,s1) -> checkSat (sings ++ sing) s1   -- does order matter?
 
 data SetVar2Result = Complete | Watched Clause2 | Singleton Clause1
 
-updClauses :: Var -> Bool -> State -> [ClauseId] -> ([Clause1],State)
-updClauses x v s0 = List.foldl' upd ([],s0)
+updClauses ::
+  Var -> Bool -> State -> [ClauseId] -> Either Clause ([Clause1],State)
+updClauses x v s0 = foldM upd ([],s0)
   where
   agn = assigned s0
 
   upd done@(sing,s) cid =
-    case Map.lookup cid (incomplete s) of
-      Nothing -> done
+    case IntMap.lookup cid (incomplete s) of
+      Nothing -> Right done
       Just wa ->
         case setVarInClause2 agn x v wa of
-          Complete    -> done
+          Complete    -> Right done
           Watched w@(Clause2 n _ _)   ->
-              (sing, s { incomplete = Map.insert cid w (incomplete s)
-                       , monitored  = Map.insertWith (++) n [cid] (monitored s)
-                        })
-          Singleton c@(Clause1 x _) -> (c : sing, s)
+              Right ( sing
+                   , s { incomplete = IntMap.insert cid w (incomplete s)
+                       , monitored  = IntMap.insertWith (++) n [cid]
+                                    $ IntMap.delete x
+                                    $ monitored s
+                   })
+          Singleton si@(Clause1 x c)
+            | Just b <- lookupVar x agn ->
+              if polarity (polarityOf x c) b then Right done else Left c
+            | otherwise -> Right (si:sing,s)
 
 
 setVarInClause2 :: Assignment -> Var -> Bool -> Clause2 -> SetVar2Result
-setVarInClause2 agn x v (Clause2 a b c) =
-  let r = foldr pick (Singleton (Clause1 other c)) (Map.toList c)
-  in case r of
-       Singleton (Clause1 _ c)
-          | all check (Map.toList c) -> r
-          | otherwise -> error "Not singleton"
-       _ -> r
+setVarInClause2 agn x v (Clause2 a b c)
+  | Just b <- lookupVar x agn, polarity (polarityOf x c) b = Complete
+  | otherwise = foldr pick (Singleton (Clause1 other c)) (IntMap.toList c)
   where
-  check (v1,p) = case lookupVar v1 agn of
-                   Nothing -> v1 == other
-                   Just b -> polarity p b == False
-
-  (this,other) = if x == a then (a,b) else (b,a)
+  other = if x == a then b else a
 
   pick (v1,p1) notMe
+    | v1 == x || v1 == other     = notMe
     | Just y <- lookupVar v1 agn = if polarity p1 y then Complete else notMe
-    | v1 == this  = notMe
-    | v1 == other = notMe
-    | otherwise = Watched (Clause2 v1 other c)  -- new var is first
+    | otherwise                  = Watched (Clause2 v1 other c)
+                                   -- new var is first
 
 
