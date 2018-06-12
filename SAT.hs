@@ -5,16 +5,14 @@ import qualified Data.IntMap as IntMap
 import           Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 import qualified Data.List as List
-import Data.Maybe(mapMaybe,listToMaybe,fromMaybe)
+import Data.Maybe(mapMaybe)
 import Data.Foldable(toList)
 import Control.Monad(foldM)
 
 import qualified Ersatz.Solution as Ersatz
 import qualified Ersatz.Problem as Ersatz
 import qualified Ersatz.Internal.Formula as Ersatz
-import qualified Ersatz.Solver.Minisat as Ersatz
 
-import Debug.Trace
 
 
 solver :: Ersatz.Solver Ersatz.SAT IO
@@ -96,7 +94,7 @@ data State = State
   } deriving Show
 
 newClause2 :: Clause2 -> State -> State
-newClause2 w@(Clause2 x y c) s =
+newClause2 w@(Clause2 x y _) s =
   s { incomplete = IntMap.insertWith (error "bug") cid w (incomplete s)
     , monitored  = IntMap.insertWith (++) x [cid]
                  $ IntMap.insertWith (++) y [cid]
@@ -162,23 +160,19 @@ checkSat sing s =
           | polarity p b -> checkSat more s
           | otherwise    -> backtrack s c
         Nothing ->
-          -- trace ("Propagating: " ++ show x ++ ", clause: " ++ show c ++ ", reason: " ++ show reason) $
           setVar more reason x val s
       where
       agn     = assigned s
       p       = polarityOf x c
       val     = polarity p True
       reason  = IntSet.unions
-                    [ lookupReason v agn | (v,p) <- IntMap.toList c
-                    , v /= x
-                    ]
+                    [ lookupReason v agn | v <- IntMap.keys c, v /= x ]
 
 backtrack :: State -> Clause -> Maybe Assignment
 backtrack s c =
   case dropWhile notRelevant (guesses s) of
     [] -> Nothing
     (x,s1) : more ->
-      -- trace ("backtracking: " ++ show (x,reasons)) $
       let (nonrs,rs) = span notRelevant more
           c1 = Clause1 x learn
           st = case map snd nonrs of
@@ -199,17 +193,13 @@ backtrack s c =
 guess :: State -> Maybe Assignment
 guess s =
   case todo (assigned s) of
-    x : _ -> -- trace ("Guessing " ++ show x ++ " to be True") $
-             setVar [] (IntSet.singleton x)
+    x : _ -> setVar [] (IntSet.singleton x)
                        x True s { guesses = (x, assigned s) : guesses s }
     []    -> return (assigned s)
 
 
 setVar :: [Clause1] -> Reason -> Var -> Bool -> State -> Maybe Assignment
 setVar sing reason v b s0 =
-  {-trace ("Setting " ++ show v ++ " to " ++ show b ++ " forced by gusses: " ++ show reason)
-  $ -}
-  -- trace ("Last guess: " ++ show (listToMaybe (map fst (guesses s0)))) $
   let s = s0 { assigned = addVarDef v (b,reason) (assigned s0) }
   in
   case IntMap.lookup v (monitored s) of
@@ -240,15 +230,15 @@ updClauses x v s0 = foldM upd ([],s0)
                                     $ IntMap.adjust (List.delete cid) x
                                     $ monitored s
                    })
-          Singleton si@(Clause1 x c)
-            | Just b <- lookupVar x agn ->
-              if polarity (polarityOf x c) b then Right done else Left c
+          Singleton si@(Clause1 y c)
+            | Just b <- lookupVar y agn ->
+              if polarity (polarityOf y c) b then Right done else Left c
             | otherwise -> Right (si:sing,s)
 
 
 setVarInClause2 :: Assignment -> Var -> Bool -> Clause2 -> SetVar2Result
 setVarInClause2 agn x v (Clause2 a b c)
-  | Just b <- lookupVar x agn, polarity (polarityOf x c) b = Complete
+  | polarity (polarityOf x c) v = Complete
   | otherwise = foldr pick (Singleton (Clause1 other c)) (IntMap.toList c)
   where
   other = if x == a then b else a
