@@ -30,9 +30,6 @@ solver (Ersatz.SAT n f _) =
             in if IntSet.size vs == IntSet.size c then Just c else Nothing
 
 type Var      = Int
-data Polarity = Neg | Pos deriving (Eq,Ord,Show)
-data Lit      = Lit { litPolarity :: Polarity, litVar :: Var }
-                  deriving Show
 
 data Assignment = Assignment
   { varVals :: IntMap {-Var-} (Bool, Reason)
@@ -48,10 +45,6 @@ addVarDef v b a = Assignment
 
 type Reason     = IntSet {-Guess-}
 
-polarity :: Polarity -> Bool -> Bool
-polarity p = case p of
-               Pos -> id
-               Neg -> not
 
 -- | The value of a varible in the given assignment, if any.
 lookupVar :: Var -> Assignment -> Maybe Bool
@@ -71,9 +64,10 @@ evalClause agn cs = or <$> mapM ev (IntSet.toList cs)
   where ev l = let v = lookupVar (abs l) agn
                in if l > 0 then v else not <$> v
 
+polarityOf :: Var -> Clause -> Bool -> Bool
+polarityOf x c = if x `IntSet.member` c then id else not
 
-polarityOf :: Var -> Clause -> Polarity
-polarityOf x c = if IntSet.member x c then Pos else Neg
+
 
 
 data Clause1  = Clause1 Var     Clause deriving Show
@@ -151,15 +145,12 @@ checkSat sing s =
     []  -> guess s
     Clause1 x c : more ->
       case lookupVar x agn of
-        Just b
-          | polarity p b -> checkSat more s
-          | otherwise    -> backtrack s c
-        Nothing ->
-          setVar more reason x val s
+        Just b  -> if p b then checkSat more s else backtrack s c
+        Nothing -> setVar more reason x val s
       where
       agn     = assigned s
       p       = polarityOf x c
-      val     = polarity p True
+      val     = p True
       reason  = IntSet.unions
                     [ lookupReason v agn | v' <- IntSet.toList c
                                          , let v = abs v', v /= x ]
@@ -230,23 +221,23 @@ updClauses x v s0 = foldM upd ([],s0)
                    })
           Singleton si@(Clause1 y c)
             | Just b <- lookupVar y agn ->
-              if polarity (polarityOf y c) b then Right done else Left c
+              if polarityOf y c b then Right done else Left c
             | otherwise -> Right (si:sing,s)
 
 
 setVarInClause2 :: Assignment -> Var -> Bool -> Clause2 -> SetVar2Result
 setVarInClause2 agn x v (Clause2 a b c)
-  | polarity (polarityOf x c) v = Complete
+  | polarityOf x c v = Complete
   | otherwise = foldr pick (Singleton (Clause1 other c)) (IntSet.toList c)
   where
   other = if x == a then b else a
 
   pick l notMe
     | v1 == x || v1 == other     = notMe
-    | Just y <- lookupVar v1 agn = if polarity p1 y then Complete else notMe
+    | Just y <- lookupVar v1 agn = if p1 y then Complete else notMe
     | otherwise                  = Watched (Clause2 v1 other c)
                                    -- new var is first
       where v1 = abs l
-            p1 = if l > 0 then Pos else Neg
+            p1 = if l > 0 then id else not
 
 
