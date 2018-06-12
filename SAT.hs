@@ -25,12 +25,9 @@ solver (Ersatz.SAT n f _) =
                          )
   where
   toCl :: Ersatz.Clause -> Maybe Clause
-  toCl cl = traverse one $ IntMap.fromListWith (++)
-              [ (abs x, [if x > 0 then Pos else Neg])
-                      | x <- IntSet.toList (Ersatz.clauseSet cl) ]
-
-  one [x] = return x
-  one _   = Nothing
+  toCl cl = let c  = Ersatz.clauseSet cl
+                vs = abs `IntSet.map` c
+            in if IntSet.size vs == IntSet.size c then Just c else Nothing
 
 type Var      = Int
 data Polarity = Neg | Pos deriving (Eq,Ord,Show)
@@ -66,19 +63,17 @@ lookupReason v a =
     Just (_,r) -> r
     Nothing    -> error ("Variable " ++ show v ++ " is not assigned")
 
-type Clause = IntMap {-Var-} Polarity
+type Clause = IntSet {-Lit-}
 
 -- | Nothing means that not all variables were defined.
 evalClause :: Assignment -> Clause -> Maybe Bool
-evalClause agn cs = or <$> mapM ev (IntMap.toList cs)
-  where ev (x,p) = polarity p <$> lookupVar x agn
+evalClause agn cs = or <$> mapM ev (IntSet.toList cs)
+  where ev l = let v = lookupVar (abs l) agn
+               in if l > 0 then v else not <$> v
 
 
 polarityOf :: Var -> Clause -> Polarity
-polarityOf x c =
-  case IntMap.lookup x c of
-    Just a -> a
-    Nothing -> error $ "Variable " ++ show x ++ " is not in " ++ show c
+polarityOf x c = if IntSet.member x c then Pos else Neg
 
 
 data Clause1  = Clause1 Var     Clause deriving Show
@@ -134,7 +129,7 @@ check cs =
 
   where
   preProc (vs,c1s,c2s) c =
-    do let vs1 = IntSet.union (IntMap.keysSet c) vs
+    do let vs1 = IntSet.union (abs `IntSet.map` c) vs
        ty <- importClause c
        case ty of
          Left c1 -> return (vs1, c1 : c1s, c2s)
@@ -142,10 +137,10 @@ check cs =
 
 importClause :: Clause -> Maybe (Either Clause1 Clause2)
 importClause c =
-  do ((x,_),rest) <- IntMap.minViewWithKey c
-     case IntMap.minViewWithKey rest of
-       Nothing        -> return $ Left (Clause1 x c)
-       Just ((y,_),_) -> return $ Right (Clause2 x y c)
+  do (x,rest) <- IntSet.minView c
+     case IntSet.minView rest of
+       Nothing    -> return $ Left (Clause1 (abs x) c)
+       Just (y,_) -> return $ Right (Clause2 (abs x) (abs y) c)
 
 
 
@@ -166,7 +161,8 @@ checkSat sing s =
       p       = polarityOf x c
       val     = polarity p True
       reason  = IntSet.unions
-                    [ lookupReason v agn | v <- IntMap.keys c, v /= x ]
+                    [ lookupReason v agn | v' <- IntSet.toList c
+                                         , let v = abs v', v /= x ]
 
 backtrack :: State -> Clause -> Maybe Assignment
 backtrack s c =
@@ -183,9 +179,11 @@ backtrack s c =
            y : _ -> let w2 = Clause2 x y learn
                     in checkSat [c1] (newClause2 w2 st)
   where
-  reasons = IntSet.unions (map (`lookupReason` assigned s) (IntMap.keys c))
-  learn   = IntMap.fromList [ (v,Neg) | v <- IntSet.toList reasons ]
-  notRelevant (x,_) = not (x `IntMap.member` learn)
+  reasons = IntSet.unions $ map ((`lookupReason` assigned s) . abs)
+                          $ IntSet.toList c
+  learn   = IntSet.fromList [ negate v | v <- IntSet.toList reasons ]
+  notRelevant (x,_) = not (x        `IntSet.member` learn ||
+                           negate x `IntSet.member` learn)
 
 
 
@@ -239,14 +237,16 @@ updClauses x v s0 = foldM upd ([],s0)
 setVarInClause2 :: Assignment -> Var -> Bool -> Clause2 -> SetVar2Result
 setVarInClause2 agn x v (Clause2 a b c)
   | polarity (polarityOf x c) v = Complete
-  | otherwise = foldr pick (Singleton (Clause1 other c)) (IntMap.toList c)
+  | otherwise = foldr pick (Singleton (Clause1 other c)) (IntSet.toList c)
   where
   other = if x == a then b else a
 
-  pick (v1,p1) notMe
+  pick l notMe
     | v1 == x || v1 == other     = notMe
     | Just y <- lookupVar v1 agn = if polarity p1 y then Complete else notMe
     | otherwise                  = Watched (Clause2 v1 other c)
                                    -- new var is first
+      where v1 = abs l
+            p1 = if l > 0 then Pos else Neg
 
 
