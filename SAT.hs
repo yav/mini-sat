@@ -23,7 +23,7 @@ solver (Ersatz.SAT n f _) =
      case check (mapMaybe toCl (toList (Ersatz.formulaSet f))) of
        Nothing -> return (Ersatz.Unsatisfied, IntMap.empty)
        Just xs -> return ( Ersatz.Satisfied
-                         , IntMap.fromList (IntMap.toList (fst <$> xs))
+                         , IntMap.fromList (IntMap.toList (fst <$> varVals xs))
                          )
   where
   toCl :: Ersatz.Clause -> Maybe Clause
@@ -39,7 +39,18 @@ data Polarity = Neg | Pos deriving (Eq,Ord,Show)
 data Lit      = Lit { litPolarity :: Polarity, litVar :: Var }
                   deriving Show
 
-type Assignment = IntMap {-Var-} (Bool, Reason)
+data Assignment = Assignment
+  { varVals :: IntMap {-Var-} (Bool, Reason)
+  , todo    :: [Var]
+  } deriving Show
+
+addVarDef :: Var -> (Bool, Reason) -> Assignment -> Assignment
+addVarDef v b a = Assignment
+  { varVals = IntMap.insert v b (varVals a)
+  , todo    = List.delete v (todo a)
+  }
+
+
 type Reason     = IntSet {-Guess-}
 
 polarity :: Polarity -> Bool -> Bool
@@ -49,11 +60,11 @@ polarity p = case p of
 
 -- | The value of a varible in the given assignment, if any.
 lookupVar :: Var -> Assignment -> Maybe Bool
-lookupVar v a = fst <$> IntMap.lookup v a
+lookupVar v a = fst <$> IntMap.lookup v (varVals a)
 
 lookupReason :: Var -> Assignment -> Reason
 lookupReason v a =
-  case IntMap.lookup v a of
+  case IntMap.lookup v (varVals a) of
     Just (_,r) -> r
     Nothing    -> error ("Variable " ++ show v ++ " is not assigned")
 
@@ -78,35 +89,31 @@ type ClauseId = Int
 
 data State = State
   { assigned    :: Assignment
-  , unassigned  :: [Var]
   , monitored   :: IntMap {-Var-} [ClauseId]
   , nextCid     :: Int
   , incomplete  :: IntMap {-ClauseId-} Clause2
-  , guesses     :: [(Var,State)]
+  , guesses     :: [(Var,Assignment)]
   } deriving Show
 
 newClause2 :: Clause2 -> State -> State
 newClause2 w@(Clause2 x y c) s =
-  trace ("Adding learned clause" ++ show c) $
-  add s { guesses = [ (x, add s1) | (x,s1) <- guesses s ] }
+  s { incomplete = IntMap.insertWith (error "bug") cid w (incomplete s)
+    , monitored  = IntMap.insertWith (++) x [cid]
+                 $ IntMap.insertWith (++) y [cid]
+                 $ monitored s
+    , nextCid = cid + 1
+    }
+
   where
   cid = nextCid s
-
-  add s1 = s1 { incomplete = IntMap.insertWith (error "bug") cid w (incomplete s1)
-              , monitored  = IntMap.insertWith (++) x [cid]
-                           $ IntMap.insertWith (++) y [cid]
-                           $ monitored s1
-
-              , nextCid = cid + 1
-              }
-
 
 check :: [Clause] -> Maybe Assignment
 check cs =
   do (vs, c1,c2) <- foldM preProc (IntSet.empty, [],[]) cs
      let inc = zip [ 0 .. ] c2 :: [(Int,Clause2)]
-         s   = State { assigned   = IntMap.empty
-                     , unassigned = IntSet.toList vs
+         s   = State { assigned   = Assignment { varVals = IntMap.empty
+                                               , todo    = IntSet.toList vs
+                                               }
                      , monitored  = IntMap.fromListWith (++)
                                       [ v | (i, Clause2 x y _) <- inc
                                           , v <- [ (x,[i]), (y,[i]) ]
@@ -175,8 +182,8 @@ backtrack s c =
       let (nonrs,rs) = span notRelevant more
           c1 = Clause1 x learn
           st = case map snd nonrs of
-                 [] -> s1
-                 ss -> last ss
+                 [] -> s { assigned = s1, guesses = more }
+                 ss -> s { assigned = last ss, guesses = rs }
       in case map fst rs of
            [] -> checkSat [c1] st
            y : _ -> let w2 = Clause2 x y learn
@@ -191,10 +198,10 @@ backtrack s c =
 
 guess :: State -> Maybe Assignment
 guess s =
-  case unassigned s of
+  case todo (assigned s) of
     x : _ -> -- trace ("Guessing " ++ show x ++ " to be True") $
              setVar [] (IntSet.singleton x)
-                       x True s { guesses = (x,s) : guesses s }
+                       x True s { guesses = (x, assigned s) : guesses s }
     []    -> return (assigned s)
 
 
@@ -203,9 +210,7 @@ setVar sing reason v b s0 =
   {-trace ("Setting " ++ show v ++ " to " ++ show b ++ " forced by gusses: " ++ show reason)
   $ -}
   -- trace ("Last guess: " ++ show (listToMaybe (map fst (guesses s0)))) $
-  let s = s0 { assigned   = IntMap.insert v (b,reason) (assigned s0)
-             , unassigned = List.delete v (unassigned s0)
-             }
+  let s = s0 { assigned = addVarDef v (b,reason) (assigned s0) }
   in
   case IntMap.lookup v (monitored s) of
     Nothing -> checkSat sing s
@@ -232,7 +237,7 @@ updClauses x v s0 = foldM upd ([],s0)
               Right ( sing
                    , s { incomplete = IntMap.insert cid w (incomplete s)
                        , monitored  = IntMap.insertWith (++) n [cid]
-                                    $ IntMap.delete x
+                                    $ IntMap.adjust (List.delete cid) x
                                     $ monitored s
                    })
           Singleton si@(Clause1 x c)
