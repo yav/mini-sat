@@ -1,7 +1,7 @@
 module SAT where
 
-import           Data.IntMap (IntMap)
-import qualified Data.IntMap as IntMap
+import           Data.IntMap.Strict (IntMap)
+import qualified Data.IntMap.Strict as IntMap
 import           Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 import qualified Data.List as List
@@ -20,66 +20,87 @@ solver (Ersatz.SAT n f _) =
   do putStrLn ("Variables: " ++ show n)
      case check (mapMaybe toCl (toList (Ersatz.formulaSet f))) of
        Nothing -> return (Ersatz.Unsatisfied, IntMap.empty)
-       Just xs -> return ( Ersatz.Satisfied
-                         , IntMap.fromList (IntMap.toList (fst <$> varVals xs))
-                         )
+       Just xs -> return
+                    ( Ersatz.Satisfied
+                    , IntMap.fromList (IntMap.toList (vvVal <$> varVals xs))
+                    )
   where
   toCl :: Ersatz.Clause -> Maybe Clause
   toCl cl = let c  = Ersatz.clauseSet cl
-                vs = abs `IntSet.map` c
+                vs = varOf `IntSet.map` c
             in if IntSet.size vs == IntSet.size c then Just c else Nothing
 
+-- | A variable is a positive int.
 type Var      = Int
 
+-- | A non-zero integer, corresponding to a literal.
+-- Negated varaibles are negative.
+type Lit      = Int
+
+-- | A clause is a set of literals, here represented by ints.
+-- Negative ints correspond to negated variables.
+type Clause   = IntSet {-Lit-}
+
+data Clause1  = Clause1 !Var      !Clause deriving Show
+data Clause2  = Clause2 !Var !Var !Clause deriving Show
+type ClauseId = Int
+
+
+-- | The value of a variable, and an explanation of how it got bound.
+data VarVal = VarVal { vvVal :: !Bool, vvReason :: !Reason }
+              deriving Show
+
+-- | Which guesses lead to the assignment of a variable.
+type Reason = IntSet {-Guess-}
+
+-- | An assignment of for all variables, and a lit of variables
+-- that are still unasigned.
 data Assignment = Assignment
-  { varVals :: IntMap {-Var-} (Bool, Reason)
-  , todo    :: [Var]
+  { varVals :: !(IntMap {-Var-} VarVal)
+  , todo    :: ![Var]
   } deriving Show
 
-addVarDef :: Var -> (Bool, Reason) -> Assignment -> Assignment
+-- | Set the value for a variable.
+addVarDef :: Var -> VarVal -> Assignment -> Assignment
 addVarDef v b a = Assignment
   { varVals = IntMap.insert v b (varVals a)
   , todo    = List.delete v (todo a)
   }
 
-
-type Reason     = IntSet {-Guess-}
-
-
 -- | The value of a varible in the given assignment, if any.
 lookupVar :: Var -> Assignment -> Maybe Bool
-lookupVar v a = fst <$> IntMap.lookup v (varVals a)
+lookupVar v a = vvVal <$> IntMap.lookup v (varVals a)
 
 lookupReason :: Var -> Assignment -> Reason
 lookupReason v a =
   case IntMap.lookup v (varVals a) of
-    Just (_,r) -> r
-    Nothing    -> error ("Variable " ++ show v ++ " is not assigned")
-
-type Clause = IntSet {-Lit-}
+    Just r  -> vvReason r
+    Nothing -> error ("Variable " ++ show v ++ " is not assigned")
 
 -- | Nothing means that not all variables were defined.
 evalClause :: Assignment -> Clause -> Maybe Bool
 evalClause agn cs = or <$> mapM ev (IntSet.toList cs)
-  where ev l = let v = lookupVar (abs l) agn
+  where ev l = let v = lookupVar (varOf l) agn
                in if l > 0 then v else not <$> v
 
+-- | Get the value of a literal in a clause, when its variable is
+-- assigned to the given boolean.
 polarityOf :: Var -> Clause -> Bool -> Bool
 polarityOf x c = if x `IntSet.member` c then id else not
 
 
+-- | The variable in a literal.
+varOf :: Lit -> Var
+varOf = abs
 
 
-data Clause1  = Clause1 Var     Clause deriving Show
-data Clause2  = Clause2 Var Var Clause deriving Show
-type ClauseId = Int
 
 data State = State
-  { assigned    :: Assignment
-  , monitored   :: IntMap {-Var-} [ClauseId]
-  , nextCid     :: Int
-  , incomplete  :: IntMap {-ClauseId-} Clause2
-  , guesses     :: [(Var,Assignment)]
+  { assigned    :: !Assignment
+  , monitored   :: !(IntMap {-Var-} [ClauseId])
+  , nextCid     :: !Int
+  , incomplete  :: !(IntMap {-ClauseId-} Clause2)
+  , guesses     :: ![(Var,Assignment)]
   } deriving Show
 
 -- | Add a new clause with at least 2 unasigned variables to the system.
@@ -124,7 +145,7 @@ check cs =
 
   where
   preProc (vs,c1s,c2s) c =
-    do let vs1 = IntSet.union (abs `IntSet.map` c) vs
+    do let vs1 = IntSet.union (varOf `IntSet.map` c) vs
        ty <- importClause c
        case ty of
          Left c1 -> return (vs1, c1 : c1s, c2s)
@@ -136,8 +157,8 @@ importClause :: Clause -> Maybe (Either Clause1 Clause2)
 importClause c =
   do (x,rest) <- IntSet.minView c
      case IntSet.minView rest of
-       Nothing    -> return $ Left (Clause1 (abs x) c)
-       Just (y,_) -> return $ Right (Clause2 (abs x) (abs y) c)
+       Nothing    -> return $ Left (Clause1 (varOf x) c)
+       Just (y,_) -> return $ Right (Clause2 (varOf x) (varOf y) c)
 
 
 -- | We do this once we've finished propagating some information.
@@ -150,7 +171,7 @@ continue what =
 -- | Set the value of a variable, and propagate the effects.
 setVar :: Var -> Bool -> Reason -> State -> Either Conflict State
 setVar x b reason s =
-  propagate x b s { assigned = addVarDef x (b,reason) (assigned s) }
+  propagate x b s { assigned = addVarDef x (VarVal b reason) (assigned s) }
 
 
 -- | Try to set the value of a variable, using a singleton clause.
@@ -165,7 +186,7 @@ setVarFromClause1 (Clause1 x c) s =
   val     = polarityOf x c True
   reason  = IntSet.unions [ lookupReason v agn
                           | v' <- IntSet.toList c
-                          , let v = abs v'
+                          , let v = varOf v'
                           , v /= x ]
 
 -- | Try to set a variable by just guessing a value for it.
@@ -175,7 +196,7 @@ guess s =
     x : _ ->
       let reason = IntSet.singleton x
           s1 = s { guesses  = (x, assigned s) : guesses s
-                 , assigned = addVarDef x (True,reason) (assigned s) }
+                 , assigned = addVarDef x (VarVal True reason) (assigned s) }
       in continue $ propagate x True s1
     []    -> return (assigned s)
 
@@ -201,7 +222,7 @@ backtrack (Conflict c s) =
            []    -> st
            y : _ -> newClause2 (Clause2 x y learn) st
   where
-  reasons = IntSet.unions $ map ((`lookupReason` assigned s) . abs)
+  reasons = IntSet.unions $ map ((`lookupReason` assigned s) . varOf)
                           $ IntSet.toList c
   learn   = IntSet.fromList [ negate v | v <- IntSet.toList reasons ]
   notRelevant (x,_) = not (x        `IntSet.member` learn ||
@@ -247,7 +268,7 @@ setVarInClause2 agn x v (Clause2 a b c)
     | Just y <- lookupVar v1 agn = if p1 y then Complete else notMe
     | otherwise                  = Watched (Clause2 v1 other c)
                                    -- new var is first
-      where v1 = abs l
+      where v1 = varOf l
             p1 = if l > 0 then id else not
 
 
