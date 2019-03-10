@@ -162,14 +162,10 @@ search s prev =
       case literalValue (stateAssignment s) l of
         Just True  -> search s { stateUnit = us } prev
         Just False -> backtrack prev (clauseVars c)
-        Nothing    -> propagateStep s { stateUnit = us } prev (clauseVars c) l
-
-propagateStep ::
-  State -> Trace -> Map Var Polarity -> Literal -> Maybe Assignment
-propagateStep s prev clo l = newStep `seq` search s1 ((newStep,s) : prev)
-  where
-  newStep = Propagate (Map.delete (litVar l) clo) l
-  s1      = setLitTrue l s
+        Nothing -> newStep `seq` search s1 ((newStep,s) : prev)
+          where
+          newStep = Propagate (Map.delete (litVar l) (clauseVars c)) l
+          s1      = setLitTrue l s { stateUnit = us }
 
 backtrack :: Trace -> Map Var Polarity -> Maybe Assignment
 backtrack steps confl =
@@ -181,8 +177,11 @@ backtrack steps confl =
         -- XXX: Also add a learned clause here
         GuessTrue x
           | Just Negated <- Map.lookup x confl ->
-            case backjump confl (s1,more) of
-              (s2,more') -> propagateStep s2 more' confl (Literal x Negated)
+            case backjump confl s1 more of
+              (s2,more') -> newStep `seq` search s3 ((newStep,s2) : more')
+                where
+                newStep = Propagate (Map.delete x confl) (Literal x Negated)
+                s3      = setVar x False s2
 
         Propagate asmps l
           | Just p <- Map.lookup (litVar l) confl
@@ -191,10 +190,10 @@ backtrack steps confl =
 
         _ -> backtrack more confl
 
-backjump :: Map Var Polarity -> (State, Trace) -> (State,Trace)
-backjump confl (s,steps) =
+backjump :: Map Var Polarity -> State -> Trace -> (State,Trace)
+backjump confl s steps  =
   case steps of
-    (step,s1) : more | skip step -> backjump confl (s1,more)
+    (step,s1) : more | skip step -> backjump confl s1 more
     _ -> (s,steps)
   where
   skip step =
