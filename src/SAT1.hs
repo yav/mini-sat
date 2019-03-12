@@ -43,13 +43,13 @@ data UnitClause = UnitClause !Literal !Clause
 
 type Assignment = Map Var Bool
 
--- | Describes how we got to a state.
-data Step       = GuessTrue !Var
-                | Propagate !(Map Var Polarity) !Literal
-
 -- | Describes how we got to the current state.
--- Each entry is the old state, paired with the step that was take to get here.
-type Trace      = [ (Step,State) ]
+-- Each steap contains the previous state and a trace to get it.
+data Trace      = GuessTrue !Var !State !Trace
+                  -- ^ Variable we guessed to be true, state before guess
+
+                | Propagate !(Map Var Polarity) !Literal !State !Trace
+                | Initial
 
 type WatchList  = Map Var (Set Clause)
 
@@ -61,6 +61,7 @@ data State = State
   , stateUnit       :: ![UnitClause]
   , stateVars       :: ![Var]
   }
+
 
 initState :: State
 initState = State { stateAssignment = Map.empty
@@ -155,56 +156,58 @@ search s prev =
 
     [] -> case pickVar s of
             Nothing     -> Just (stateAssignment s)
-            Just (x,s1) -> search (setVar x True s1)
-                                  ((GuessTrue x, s) : prev)
+            Just (x,s1) -> search (setVar x True s1) (GuessTrue x s prev)
 
     UnitClause l c : us ->
       case literalValue (stateAssignment s) l of
         Just True  -> search s { stateUnit = us } prev
         Just False -> backtrack prev (clauseVars c)
-        Nothing -> newStep `seq` search s1 ((newStep,s) : prev)
+        Nothing    -> search s1 newTr
           where
-          newStep = Propagate (Map.delete (litVar l) (clauseVars c)) l
-          s1      = setLitTrue l s { stateUnit = us }
+          newTr = Propagate (Map.delete (litVar l) (clauseVars c)) l s prev
+          s1    = setLitTrue l s { stateUnit = us }
 
 backtrack :: Trace -> Map Var Polarity -> Maybe Assignment
 backtrack steps confl =
   case steps of
-    [] -> Nothing
-    (step,s1) : more ->
-      case step of
+    Initial -> Nothing
 
+    GuessTrue x s more ->
+
+      case Map.lookup x confl of
         -- XXX: Also add a learned clause here
-        GuessTrue x
-          | Just Negated <- Map.lookup x confl ->
-            case backjump confl s1 more of
-              (s2,more') -> newStep `seq` search s3 ((newStep,s2) : more')
-                where
-                newStep = Propagate (Map.delete x confl) (Literal x Negated)
-                s3      = setVar x False s2
-
-        Propagate asmps l
-          | Just p <- Map.lookup (litVar l) confl
-          , negatePolarity p == litPol l ->
-            backtrack more (Map.union asmps confl)
+        Just Negated -> search s2 newTr
+          where
+          (s1,more') = backjump confl s more
+          s2    = setVar x False s1
+          newTr = Propagate (Map.delete x confl) (Literal x Negated) s1 more'
 
         _ -> backtrack more confl
+
+
+    Propagate asmps l _ more -> backtrack more newConfl
+      where
+      newConfl =
+        case Map.lookup (litVar l) confl of
+          Just p | negatePolarity p == litPol l -> Map.union asmps confl
+          _                                     -> confl
 
 backjump :: Map Var Polarity -> State -> Trace -> (State,Trace)
 backjump confl s steps  =
   case steps of
-    (step,s1) : more | skip step -> backjump confl s1 more
+    GuessTrue x s1 more
+      | not (x `Map.member` confl) -> backjump confl s1 more
+
+    Propagate _ l s1 more
+      | not (litVar l `Map.member` confl) -> backjump confl s1 more
+
     _ -> (s,steps)
-  where
-  skip step =
-    case step of
-      GuessTrue x   -> not (x `Map.member` confl)
-      Propagate _ l -> not (litVar l `Map.member` confl)
+
 
 check :: [Map Var Polarity] -> Maybe Assignment
 check cs =
   do (_,s) <- foldM mk (0,s0) cs
-     search s []
+     search s Initial
   where
   s0 = initState { stateVars = Set.toList (Set.unions (map Map.keysSet cs)) }
   mk (n,s) mp =
