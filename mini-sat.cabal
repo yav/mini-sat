@@ -16,7 +16,7 @@ category:            Math
 extra-source-files:  CHANGELOG.md
 
 library
-  exposed-modules:     SAT,SAT1
+  exposed-modules:     SAT,SAT1, ErSAT
   -- other-modules:
   -- other-extensions:
   build-depends:       base ^>=4.12.0.0,

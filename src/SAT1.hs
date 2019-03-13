@@ -1,31 +1,18 @@
-module SAT1 (solver1) where
+{-# Language BangPatterns #-}
+module SAT1 (check, Var(..),Polarity(..), Assignment) where
 
 import Data.Set(Set)
 import qualified Data.Set as Set
 import Data.Map(Map)
 import qualified Data.Map as Map
-import Data.Maybe(mapMaybe)
-import Data.Foldable(foldl',toList)
+import Data.Foldable(foldl')
 import Control.Monad(foldM)
-
-import Data.IntMap (IntMap)
-import qualified Data.IntMap as IntMap
-import Data.IntSet (IntSet)
-import qualified Data.IntSet as IntSet
-import qualified Ersatz.Solution as Ersatz
-import qualified Ersatz.Problem as Ersatz
-import qualified Ersatz.Internal.Formula as Ersatz
-
 
 newtype Var     = Var Int
                   deriving (Eq,Ord,Show)
 
 data Polarity   = Negated | Positive
                   deriving (Eq,Ord,Show)
-
-data Literal    = Literal { litVar :: {-# UNPACK #-} !Var
-                          , litPol ::                !Polarity
-                          } deriving (Eq,Ord,Show)
 
 type ClauseId   = Int
 data Clause     = Clause { clauseId   :: {-# UNPACK #-} !ClauseId
@@ -38,7 +25,7 @@ instance Eq Clause where
 instance Ord Clause where
   compare c d = compare (clauseId c) (clauseId d)
 
-data UnitClause = UnitClause !Literal !Clause
+data UnitClause = UnitClause !Var !Polarity !Clause
                     deriving Show
 
 type Assignment = Map Var Bool
@@ -48,7 +35,7 @@ type Assignment = Map Var Bool
 data Trace      = GuessTrue !Var !State !Trace
                   -- ^ Variable we guessed to be true, state before guess
 
-                | Propagate !(Map Var Polarity) !Literal !State !Trace
+                | Propagate !(Map Var Polarity) !Var !Polarity !State !Trace
                 | Initial
 
 type WatchList  = Map Var (Set Clause)
@@ -89,20 +76,19 @@ negatePolarity p =
     Positive -> Negated
 
 -- | Compute the value of a literal under the given assignment, if any.
-literalValue :: Assignment -> Literal -> Maybe Bool
-literalValue agn l =
-  do b <- Map.lookup (litVar l) agn
-     pure $! case litPol l of
+literalValue :: Assignment -> Var -> Polarity -> Maybe Bool
+literalValue agn x pol =
+  do b <- Map.lookup x agn
+     pure $! case pol of
                Positive -> b
                Negated  -> not b
 
 
 -- | Try to watch the variable of a literal from a clause.
 -- Fails if we already have an entry for this clause and this variable.
-tryAddWatch :: Literal -> Clause -> WatchList -> Maybe WatchList
-tryAddWatch l c w = Map.alterF upd x w
+tryAddWatch :: Var -> Clause -> WatchList -> Maybe WatchList
+tryAddWatch x c w = Map.alterF upd x w
   where
-  x = litVar l
   upd mb =
     case mb of
       Nothing -> Just $! Just $! Set.singleton c
@@ -129,19 +115,17 @@ moveClause (ps0,s0,ws) c =
   ws1 = Set.insert c ws
 
   checkLit x pol mb =
-    let l = Literal x pol
-    in
-    case literalValue agn l of
+    case literalValue agn x pol of
       Just True  -> Just (ps0,s0,ws1) -- trivially true
       Just False -> mb
       Nothing ->
-        case tryAddWatch l c wl of
+        case tryAddWatch x c wl of
           Just w1 -> Just (ps0 { stateWatch = w1 }, s0, ws) -- moved
           Nothing ->
             case mb of
               Nothing -> -- unit
                   Just ( ps0
-                       , s0 { stateUnit = UnitClause l c : stateUnit s0 }
+                       , s0 { stateUnit = UnitClause x pol c : stateUnit s0 }
                        , ws1
                        )
               _ -> mb
@@ -149,7 +133,7 @@ moveClause (ps0,s0,ws) c =
 -- | Set a previously unasigned variable to a given value an
 -- move around clauses as needed.
 setVar :: Var -> Bool -> PermState -> State -> (PermState,State)
-setVar x b ps s =
+setVar !x !b !ps !s =
   case Map.lookup x (stateWatch ps) of
     Nothing   -> (ps, s')   -- no-one needs updates
     Just todo -> ( ps1 { stateWatch = Map.insert x ws (stateWatch ps1) }
@@ -160,10 +144,6 @@ setVar x b ps s =
   where
   s'       = s { stateAssignment = Map.insert x b (stateAssignment s) }
 
--- | Set the given literal to True, and move clauses around as needed.
-setLitTrue :: Literal -> PermState -> State -> (PermState,State)
-setLitTrue l ps s = setVar (litVar l) (litPol l == Positive) ps s
-
 pickVar :: State -> Maybe (Var,State)
 pickVar s = case dropWhile done (stateVars s) of
               []     -> Nothing
@@ -171,7 +151,7 @@ pickVar s = case dropWhile done (stateVars s) of
   where done x = x `Map.member` stateAssignment s
 
 search :: PermState -> State -> Trace -> Maybe Assignment
-search ps s prev =
+search !ps !s prev =
   case stateUnit s of
 
     [] -> case pickVar s of
@@ -179,17 +159,17 @@ search ps s prev =
             Just (x,s1) ->  search ps1 s2 (GuessTrue x s prev)
               where (ps1,s2) = setVar x True ps s1
 
-    UnitClause l c : us ->
-      case literalValue (stateAssignment s) l of
+    UnitClause x p c : us ->
+      case literalValue (stateAssignment s) x p of
         Just True  -> search ps s { stateUnit = us } prev
         Just False -> backtrack ps prev (clauseVars c)
-        Nothing    -> seq ps1 $ seq s1 $ search ps1 s1 newTr
+        Nothing    -> search ps1 s1 newTr
           where
-          newTr     = Propagate (Map.delete (litVar l) (clauseVars c)) l s prev
-          (ps1,s1)  = setLitTrue l ps s { stateUnit = us }
+          newTr     = Propagate (Map.delete x (clauseVars c)) x p s prev
+          (ps1,s1)  = setVar x (p == Positive) ps s { stateUnit = us }
 
 backtrack :: PermState -> Trace -> Map Var Polarity -> Maybe Assignment
-backtrack ps steps confl =
+backtrack !ps !steps !confl =
   case steps of
     Initial -> Nothing
 
@@ -198,13 +178,11 @@ backtrack ps steps confl =
       case Map.lookup x confl of
         Just Negated ->
           case mbY of
-            Nothing -> s2 `seq` search ps1 s2 more'
-            Just y ->
-              let ps2 = watchAt x y c ps1
-              in ps2 `seq` s2 `seq` search ps2 s2 more'
+            Nothing -> search ps1 s2 more'
+            Just y  -> search (watchAt x y c ps1) s2 more'
 
           where
-          s2             = s1 { stateUnit = UnitClause (Literal x Negated) c
+          s2             = s1 { stateUnit = UnitClause x Negated c
                                           : stateUnit s1 }
           (mbY,s1,more') = backjump confl s more
           (c,ps1)        = newFreeClause ps (negatePolarity <$> confl)
@@ -213,12 +191,12 @@ backtrack ps steps confl =
         _ -> backtrack ps more confl
 
 
-    Propagate asmps l _ more -> backtrack ps more newConfl
+    Propagate asmps x p _ more -> backtrack ps more newConfl
       where
       newConfl =
-        case Map.lookup (litVar l) confl of
-          Just p | negatePolarity p == litPol l -> Map.union asmps confl
-          _                                     -> confl
+        case Map.lookup x confl of
+          Just p1 | negatePolarity p1 == p -> Map.union asmps confl
+          _                                -> confl
 
 backjump :: Map Var Polarity -> State -> Trace -> (Maybe Var,State,Trace)
 backjump confl s steps  =
@@ -227,9 +205,9 @@ backjump confl s steps  =
       | not (x `Map.member` confl) -> backjump confl s1 more
       | otherwise -> (Just x,s,steps)
 
-    Propagate _ l s1 more
-      | not (litVar l `Map.member` confl) -> backjump confl s1 more
-      | otherwise -> (Just (litVar l),s,steps)
+    Propagate _ x _ s1 more
+      | not (x `Map.member` confl) -> backjump confl s1 more
+      | otherwise -> (Just x,s,steps)
 
     Initial -> (Nothing,s,steps)
 
@@ -257,37 +235,12 @@ newClause (ps,s) lits =
      let (c,ps1) = newFreeClause ps lits
      case Map.minViewWithKey mp1 of
        Nothing ->
-         let newS = s { stateUnit = UnitClause (Literal x p) c : stateUnit s }
+         let newS = s { stateUnit = UnitClause x p c : stateUnit s }
          in ps1 `seq` newS `seq` Just (ps1,newS)
 
        Just ((y,_),_) ->
          let newPS = watchAt x y c ps1
          in newPS `seq` Just (newPS, s)
 
-
-solver1 :: Ersatz.Solver Ersatz.SAT IO
-solver1 (Ersatz.SAT n f _) =
-  do putStrLn ("Variables: " ++ show n)
-     let cs = mapMaybe toCl (toList (Ersatz.formulaSet f))
-     putStrLn ("Clauses: " ++ show (length cs))
-     case check cs of
-       Nothing -> return (Ersatz.Unsatisfied, IntMap.empty)
-       Just xs -> return (Ersatz.Satisfied, toSln xs)
-  where
-  toCl :: Ersatz.Clause -> Maybe (Map Var Polarity)
-  toCl cl = let c  = Ersatz.clauseSet cl
-                vs = abs `IntSet.map` c
-            in if IntSet.size vs == IntSet.size c
-                  then Just (toMp c)
-                  else Nothing
-
-  toMp :: IntSet -> Map Var Polarity
-  toMp = Map.fromList . map toEntry . IntSet.toList
-
-  toEntry :: Int -> (Var,Polarity)
-  toEntry x = (Var (abs x), if x > 0 then Positive else Negated)
-
-  toSln :: Assignment -> IntMap Bool
-  toSln agn = IntMap.fromList [ (x,b) | (Var x,b) <- Map.toList agn ]
-
-
+pair :: a -> b -> (a,b)
+pair !x !y = (x,y)
