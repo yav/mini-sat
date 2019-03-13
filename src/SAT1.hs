@@ -106,7 +106,7 @@ moveClause :: (PermState, State, Set Clause) -> Clause ->
               (PermState, State, Set Clause)
 moveClause (ps0,s0,ws) c =
   case Map.foldrWithKey checkLit Nothing (clauseVars c) of
-    Nothing -> (ps0,s0,ws1) -- conflict
+    Nothing -> tripple ps0 s0 ws1 -- conflict
     Just res -> res
 
   where
@@ -116,18 +116,18 @@ moveClause (ps0,s0,ws) c =
 
   checkLit x pol mb =
     case literalValue agn x pol of
-      Just True  -> Just (ps0,s0,ws1) -- trivially true
+      Just True  -> Just $! tripple ps0 s0 ws1 -- trivially true
       Just False -> mb
       Nothing ->
         case tryAddWatch x c wl of
-          Just w1 -> Just (ps0 { stateWatch = w1 }, s0, ws) -- moved
+          Just w1 -> Just $! tripple ps0 { stateWatch = w1 } s0 ws -- moved
           Nothing ->
             case mb of
               Nothing -> -- unit
-                  Just ( ps0
-                       , s0 { stateUnit = UnitClause x pol c : stateUnit s0 }
-                       , ws1
-                       )
+                  Just $! tripple
+                            ps0
+                            s0 { stateUnit = UnitClause x pol c : stateUnit s0 }
+                            ws1
               _ -> mb
 
 -- | Set a previously unasigned variable to a given value an
@@ -135,10 +135,9 @@ moveClause (ps0,s0,ws) c =
 setVar :: Var -> Bool -> PermState -> State -> (PermState,State)
 setVar !x !b !ps !s =
   case Map.lookup x (stateWatch ps) of
-    Nothing   -> (ps, s')   -- no-one needs updates
-    Just todo -> ( ps1 { stateWatch = Map.insert x ws (stateWatch ps1) }
-                 , s1
-                 )
+    Nothing   -> pair ps s'   -- no-one needs updates
+    Just todo -> pair ps1 { stateWatch = Map.insert x ws (stateWatch ps1) }
+                      s1
       where (ps1,s1,ws) = foldl' moveClause (ps,s',Set.empty) todo
 
   where
@@ -220,27 +219,27 @@ check cs =
   s0 = initState { stateVars = Set.toList (Set.unions (map Map.keysSet cs)) }
 
 newFreeClause :: PermState -> Map Var Polarity -> (Clause, PermState)
-newFreeClause s lits = c `seq` s1 `seq` (c,s1)
+newFreeClause s lits = pair c s1
   where n  = stateNextClause s
         c  = Clause { clauseId = n, clauseVars = lits }
         s1 = s { stateNextClause = n + 1 }
 
 watchAt :: Var -> Var -> Clause -> PermState -> PermState
 watchAt x y c s = s { stateWatch = add x $ add y $ stateWatch s }
-  where add v = Map.insertWith Set.union v (Set.singleton c)
+  where add v = Map.insertWith Set.union v $! Set.singleton c
 
 newClause :: (PermState,State) -> Map Var Polarity -> Maybe (PermState, State)
 newClause (ps,s) lits =
   do ((x,p),mp1) <- Map.minViewWithKey lits
      let (c,ps1) = newFreeClause ps lits
-     case Map.minViewWithKey mp1 of
-       Nothing ->
-         let newS = s { stateUnit = UnitClause x p c : stateUnit s }
-         in ps1 `seq` newS `seq` Just (ps1,newS)
-
-       Just ((y,_),_) ->
-         let newPS = watchAt x y c ps1
-         in newPS `seq` Just (newPS, s)
+     Just $! case Map.minViewWithKey mp1 of
+               Nothing ->
+                 pair ps1 s { stateUnit = UnitClause x p c : stateUnit s }
+               Just ((y,_),_) -> pair (watchAt x y c ps1) s
 
 pair :: a -> b -> (a,b)
 pair !x !y = (x,y)
+
+tripple :: a -> b -> c -> (a,b,c)
+tripple !x !y !z = (x,y,z)
+
