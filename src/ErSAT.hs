@@ -1,4 +1,4 @@
-module ErSAT (solver1) where
+module ErSAT (solver) where
 
 import Data.Map(Map)
 import qualified Data.Map as Map
@@ -13,10 +13,10 @@ import qualified Ersatz.Solution as Ersatz
 import qualified Ersatz.Problem as Ersatz
 import qualified Ersatz.Internal.Formula as Ersatz
 
-import SAT1
+import SAT
 
-solver1 :: Ersatz.Solver Ersatz.SAT IO
-solver1 (Ersatz.SAT n f _) =
+solver :: Ersatz.Solver Ersatz.SAT IO
+solver (Ersatz.SAT n f _) =
   do putStrLn ("Variables: " ++ show n)
      let cs = mapMaybe toCl (toList (Ersatz.formulaSet f))
      putStrLn ("Clauses: " ++ show (length cs))

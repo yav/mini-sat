@@ -1,274 +1,245 @@
-module SAT where
+{-# Language BangPatterns #-}
+module SAT (check, Var(..),Polarity(..), Assignment) where
 
-import           Data.IntMap (IntMap)
-import qualified Data.IntMap as IntMap
-import           Data.IntSet (IntSet)
-import qualified Data.IntSet as IntSet
-import qualified Data.List as List
-import Data.Maybe(mapMaybe)
-import Data.Foldable(toList)
+import Data.Set(Set)
+import qualified Data.Set as Set
+import Data.Map(Map)
+import qualified Data.Map as Map
+import Data.Foldable(foldl')
 import Control.Monad(foldM)
 
-import qualified Ersatz.Solution as Ersatz
-import qualified Ersatz.Problem as Ersatz
-import qualified Ersatz.Internal.Formula as Ersatz
+newtype Var     = Var Int
+                  deriving (Eq,Ord,Show)
+
+data Polarity   = Negated | Positive
+                  deriving (Eq,Ord,Show)
+
+type ClauseId   = Int
+data Clause     = Clause { clauseId   :: {-# UNPACK #-} !ClauseId
+                         , clauseVars ::                !(Map Var Polarity)
+                         } deriving Show
+
+instance Eq Clause where
+  c == d = clauseId c == clauseId d
+
+instance Ord Clause where
+  compare c d = compare (clauseId c) (clauseId d)
+
+data UnitClause = UnitClause !Var !Polarity !Clause
+                    deriving Show
+
+type Assignment = Map Var Bool
+
+-- | Describes how we got to the current state.
+-- Each steap contains the previous state and a trace to get it.
+data Trace      = GuessTrue !Var !State !Trace
+                  -- ^ Variable we guessed to be true, state before guess
+
+                | Propagate !(Map Var Polarity) !Var !Polarity !State !Trace
+                | Initial
+
+type WatchList  = Map Var (Set Clause)
 
 
 
-solver :: Ersatz.Solver Ersatz.SAT IO
-solver (Ersatz.SAT n f _) =
-  do putStrLn ("Variables: " ++ show n)
-     case check (mapMaybe toCl (toList (Ersatz.formulaSet f))) of
-       Nothing -> return (Ersatz.Unsatisfied, IntMap.empty)
-       Just xs -> return
-                    ( Ersatz.Satisfied
-                    , IntMap.fromList (IntMap.toList (vvVal <$> varVals xs))
-                    )
-  where
-  toCl :: Ersatz.Clause -> Maybe Clause
-  toCl cl = let c  = Ersatz.clauseSet cl
-                vs = varOf `IntSet.map` c
-            in if IntSet.size vs == IntSet.size c then Just c else Nothing
-
--- | A variable is a positive int.
-type Var      = Int
-
--- | A non-zero integer, corresponding to a literal.
--- Negated varaibles are negative.
-type Lit      = Int
-
--- | A clause is a set of literals, here represented by ints.
--- Negative ints correspond to negated variables.
-type Clause   = IntSet {-Lit-}
-
-data Clause1  = Clause1 !Var      !Clause deriving Show
-data Clause2  = Clause2 !Var !Var !Clause deriving Show
-type ClauseId = Int
-
-
--- | The value of a variable, and an explanation of how it got bound.
-data VarVal = VarVal { vvVal :: !Bool, vvReason :: !Reason }
-              deriving Show
-
--- | Which guesses lead to the assignment of a variable.
-type Reason = IntSet {-Guess-}
-
--- | An assignment of for all variables, and a lit of variables
--- that are still unasigned.
-data Assignment = Assignment
-  { varVals :: !(IntMap {-Var-} VarVal)
-  , todo    :: ![Var]
-  } deriving Show
-
--- | Set the value for a variable.
-addVarDef :: Var -> VarVal -> Assignment -> Assignment
-addVarDef v b a = Assignment
-  { varVals = IntMap.insert v b (varVals a)
-  , todo    = List.delete v (todo a)
+-- | State which backtrack
+data State = State
+  { stateAssignment :: !Assignment
+  , stateUnit       :: ![UnitClause]
+  , stateVars       :: ![Var]
   }
 
--- | The value of a varible in the given assignment, if any.
-lookupVar :: Var -> Assignment -> Maybe Bool
-lookupVar v a = vvVal <$> IntMap.lookup v (varVals a)
-
-lookupReason :: Var -> Assignment -> Reason
-lookupReason v a =
-  case IntMap.lookup v (varVals a) of
-    Just r  -> vvReason r
-    Nothing -> error ("Variable " ++ show v ++ " is not assigned")
-
--- | Nothing means that not all variables were defined.
-evalClause :: Assignment -> Clause -> Maybe Bool
-evalClause agn cs = or <$> mapM ev (IntSet.toList cs)
-  where ev l = let v = lookupVar (varOf l) agn
-               in if l > 0 then v else not <$> v
-
--- | Get the value of a literal in a clause, when its variable is
--- assigned to the given boolean.
-polarityOf :: Var -> Clause -> Bool -> Bool
-polarityOf x c = if x `IntSet.member` c then id else not
+-- | State that does not backtrack
+data PermState = PermState
+  { stateNextClause :: !Int
+  , stateWatch      :: !WatchList
+  }
 
 
--- | The variable in a literal.
-varOf :: Lit -> Var
-varOf = abs
+initState :: State
+initState = State { stateAssignment = Map.empty
+                  , stateUnit       = []
+                  , stateVars       = []
+                  }
+
+initPermState :: PermState
+initPermState = PermState { stateWatch      = Map.empty
+                          , stateNextClause = 0
+                          }
 
 
+-- | Compute the opposite polarity.
+negatePolarity :: Polarity -> Polarity
+negatePolarity p =
+  case p of
+    Negated  -> Positive
+    Positive -> Negated
 
-data State = State
-  { assigned    :: !Assignment
-  , monitored   :: !(IntMap {-Var-} [ClauseId])
-  , nextCid     :: !Int
-  , incomplete  :: !(IntMap {-ClauseId-} Clause2)
-  , guesses     :: ![(Var,Assignment)]
-  } deriving Show
+-- | Compute the value of a literal under the given assignment, if any.
+literalValue :: Assignment -> Var -> Polarity -> Maybe Bool
+literalValue agn x pol =
+  do b <- Map.lookup x agn
+     pure $! case pol of
+               Positive -> b
+               Negated  -> not b
 
--- | Add a new clause with at least 2 unasigned variables to the system.
-newClause2 :: Clause2 -> State -> State
-newClause2 w@(Clause2 x y _) s =
-  s { incomplete = IntMap.insertWith (error "bug") cid w (incomplete s)
-    , monitored  = IntMap.insertWith (++) x [cid]
-                 $ IntMap.insertWith (++) y [cid]
-                 $ monitored s
-    , nextCid = cid + 1
-    }
+
+-- | Try to watch the variable of a literal from a clause.
+-- Fails if we already have an entry for this clause and this variable.
+tryAddWatch :: Var -> Clause -> WatchList -> Maybe WatchList
+tryAddWatch x c w = Map.alterF upd x w
+  where
+  upd mb =
+    case mb of
+      Nothing -> Just $! Just $! Set.singleton c
+      Just cs
+        | c `Set.member` cs -> Nothing
+        | otherwise         -> Just $! Just $! Set.insert c cs
+
+
+-- | Try to move a clause to a new watch location.
+-- Conflict and unit clauses are not moved, as well as clauses that
+-- have already become true.  Instead, they are added to the set of
+-- clauses that will stay on this watch list.
+-- New unit clauses are added to the unit clause list.
+moveClause :: (PermState, State, Set Clause) -> Clause ->
+              (PermState, State, Set Clause)
+moveClause (ps0,s0,ws) c =
+  case Map.foldrWithKey checkLit Nothing (clauseVars c) of
+    Nothing -> tripple ps0 s0 ws1 -- conflict
+    Just res -> res
 
   where
-  cid = nextCid s
+  agn = stateAssignment s0
+  wl  = stateWatch ps0
+  ws1 = Set.insert c ws
 
-check :: [Clause] -> Maybe Assignment
+  checkLit x pol mb =
+    case literalValue agn x pol of
+      Just True  -> Just $! tripple ps0 s0 ws1 -- trivially true
+      Just False -> mb
+      Nothing ->
+        case tryAddWatch x c wl of
+          Just w1 -> Just $! tripple ps0 { stateWatch = w1 } s0 ws -- moved
+          Nothing ->
+            case mb of
+              Nothing -> -- unit
+                  Just $! tripple
+                            ps0
+                            s0 { stateUnit = UnitClause x pol c : stateUnit s0 }
+                            ws1
+              _ -> mb
+
+-- | Set a previously unasigned variable to a given value an
+-- move around clauses as needed.
+setVar :: Var -> Bool -> PermState -> State -> (PermState,State)
+setVar !x !b !ps !s =
+  case Map.lookup x (stateWatch ps) of
+    Nothing   -> pair ps s'   -- no-one needs updates
+    Just todo -> pair ps1 { stateWatch = Map.insert x ws (stateWatch ps1) }
+                      s1
+      where (ps1,s1,ws) = foldl' moveClause (ps,s',Set.empty) todo
+
+  where
+  s'       = s { stateAssignment = Map.insert x b (stateAssignment s) }
+
+pickVar :: State -> Maybe (Var,State)
+pickVar s = case dropWhile done (stateVars s) of
+              []     -> Nothing
+              x : xs -> Just (x, s { stateVars = xs })
+  where done x = x `Map.member` stateAssignment s
+
+search :: PermState -> State -> Trace -> Maybe Assignment
+search !ps !s prev =
+  case stateUnit s of
+
+    [] -> case pickVar s of
+            Nothing     -> Just (stateAssignment s)
+            Just (x,s1) ->  search ps1 s2 (GuessTrue x s prev)
+              where (ps1,s2) = setVar x True ps s1
+
+    UnitClause x p c : us ->
+      case literalValue (stateAssignment s) x p of
+        Just True  -> search ps s { stateUnit = us } prev
+        Just False -> backtrack ps prev (clauseVars c)
+        Nothing    -> search ps1 s1 newTr
+          where
+          newTr     = Propagate (Map.delete x (clauseVars c)) x p s prev
+          (ps1,s1)  = setVar x (p == Positive) ps s { stateUnit = us }
+
+backtrack :: PermState -> Trace -> Map Var Polarity -> Maybe Assignment
+backtrack !ps !steps !confl =
+  case steps of
+    Initial -> Nothing
+
+    GuessTrue x s more ->
+
+      case Map.lookup x confl of
+        Just Negated ->
+          case mbY of
+            Nothing -> search ps1 s2 more'
+            Just y  -> search (watchAt x y c ps1) s2 more'
+
+          where
+          s2             = s1 { stateUnit = UnitClause x Negated c
+                                          : stateUnit s1 }
+          (mbY,s1,more') = backjump confl s more
+          (c,ps1)        = newFreeClause ps (negatePolarity <$> confl)
+                                                      -- learned clause
+
+        _ -> backtrack ps more confl
+
+
+    Propagate asmps x p _ more -> backtrack ps more newConfl
+      where
+      newConfl =
+        case Map.lookup x confl of
+          Just p1 | negatePolarity p1 == p -> Map.union asmps confl
+          _                                -> confl
+
+backjump :: Map Var Polarity -> State -> Trace -> (Maybe Var,State,Trace)
+backjump confl s steps  =
+  case steps of
+    GuessTrue x s1 more
+      | not (x `Map.member` confl) -> backjump confl s1 more
+      | otherwise -> (Just x,s,steps)
+
+    Propagate _ x _ s1 more
+      | not (x `Map.member` confl) -> backjump confl s1 more
+      | otherwise -> (Just x,s,steps)
+
+    Initial -> (Nothing,s,steps)
+
+
+check :: [Map Var Polarity] -> Maybe Assignment
 check cs =
-  do (vs, c1,c2) <- foldM preProc (IntSet.empty, [],[]) cs
-     let inc = zip [ 0 .. ] c2 :: [(Int,Clause2)]
-         s   = State { assigned   = Assignment { varVals = IntMap.empty
-                                               , todo    = IntSet.toList vs
-                                               }
-                     , monitored  = IntMap.fromListWith (++)
-                                      [ v | (i, Clause2 x y _) <- inc
-                                          , v <- [ (x,[i]), (y,[i]) ]
-                                      ]
-                     , nextCid    = length inc
-                     , incomplete = IntMap.fromList inc
-                     , guesses    = []
-                     }
-     sln <- continue $ foldM (flip setVarFromClause1) s c1
-     case mapM (evalClause sln) cs of
-       Just xs | and xs -> return ()
-               | otherwise ->
-                error $ unlines ("Not all clauses were true:"
-                                  : map show (zip xs cs))
-
-       Nothing -> error "Not all variables were assigned"
-
-     return sln
-
-
+  do (ps,s) <- foldM newClause (initPermState,s0) cs
+     search ps s Initial
   where
-  preProc (vs,c1s,c2s) c =
-    do let vs1 = IntSet.union (varOf `IntSet.map` c) vs
-       ty <- importClause c
-       case ty of
-         Left c1 -> return (vs1, c1 : c1s, c2s)
-         Right c2 -> return (vs1, c1s, c2 : c2s)
+  s0 = initState { stateVars = Set.toList (Set.unions (map Map.keysSet cs)) }
 
--- | Classify a clause: 'Nothing' means that the clause was empty,
--- and thus trivially false.
-importClause :: Clause -> Maybe (Either Clause1 Clause2)
-importClause c =
-  do (x,rest) <- IntSet.minView c
-     case IntSet.minView rest of
-       Nothing    -> return $ Left (Clause1 (varOf x) c)
-       Just (y,_) -> return $ Right (Clause2 (varOf x) (varOf y) c)
+newFreeClause :: PermState -> Map Var Polarity -> (Clause, PermState)
+newFreeClause s lits = pair c s1
+  where n  = stateNextClause s
+        c  = Clause { clauseId = n, clauseVars = lits }
+        s1 = s { stateNextClause = n + 1 }
 
+watchAt :: Var -> Var -> Clause -> PermState -> PermState
+watchAt x y c s = s { stateWatch = add x $ add y $ stateWatch s }
+  where add v = Map.insertWith Set.union v $! Set.singleton c
 
--- | We do this once we've finished propagating some information.
-continue :: Either Conflict State -> Maybe Assignment
-continue what =
-  case what of
-    Left c  -> backtrack c
-    Right s -> guess s
+newClause :: (PermState,State) -> Map Var Polarity -> Maybe (PermState, State)
+newClause (ps,s) lits =
+  do ((x,p),mp1) <- Map.minViewWithKey lits
+     let (c,ps1) = newFreeClause ps lits
+     Just $! case Map.minViewWithKey mp1 of
+               Nothing ->
+                 pair ps1 s { stateUnit = UnitClause x p c : stateUnit s }
+               Just ((y,_),_) -> pair (watchAt x y c ps1) s
 
--- | Set the value of a variable, and propagate the effects.
-setVar :: Var -> Bool -> Reason -> State -> Either Conflict State
-setVar x b reason s =
-  propagate x b s { assigned = addVarDef x (VarVal b reason) (assigned s) }
+pair :: a -> b -> (a,b)
+pair !x !y = (x,y)
 
-
--- | Try to set the value of a variable, using a singleton clause.
--- Fails if the variables has already been assigned in a conflicting way.
-setVarFromClause1 :: Clause1 -> State -> Either Conflict State
-setVarFromClause1 (Clause1 x c) s =
-  case lookupVar x agn of
-    Just b1 -> if b1 == val then return s else Left (Conflict c s)
-    Nothing -> setVar x val reason s
-  where
-  agn     = assigned s
-  val     = polarityOf x c True
-  reason  = IntSet.unions [ lookupReason v agn
-                          | v' <- IntSet.toList c
-                          , let v = varOf v'
-                          , v /= x ]
-
--- | Try to set a variable by just guessing a value for it.
-guess :: State -> Maybe Assignment
-guess s =
-  case todo (assigned s) of
-    x : _ ->
-      let reason = IntSet.singleton x
-          s1 = s { guesses  = (x, assigned s) : guesses s
-                 , assigned = addVarDef x (VarVal True reason) (assigned s) }
-      in continue $ propagate x True s1
-    []    -> return (assigned s)
-
-
-
-
-data Conflict = Conflict Clause State
-
--- | Resolve the given conflict by backtracking.
-backtrack :: Conflict -> Maybe Assignment
-backtrack (Conflict c s) =
-  case dropWhile notRelevant (guesses s) of
-    [] -> Nothing
-    (x,s1) : more ->
-      let (nonrs,rs) = span notRelevant more
-          c1 = Clause1 x learn
-          st = case map snd nonrs of
-                 [] -> s { assigned = s1, guesses = more }
-                 ss -> s { assigned = last ss, guesses = rs }
-      in continue
-       $ setVarFromClause1 c1
-       $ case map fst rs of
-           []    -> st
-           y : _ -> newClause2 (Clause2 x y learn) st
-  where
-  reasons = IntSet.unions $ map ((`lookupReason` assigned s) . varOf)
-                          $ IntSet.toList c
-  learn   = IntSet.fromList [ negate v | v <- IntSet.toList reasons ]
-  notRelevant (x,_) = not (x        `IntSet.member` learn ||
-                           negate x `IntSet.member` learn)
-
-
--- | Propagate the fact that a variable got a speicific value.
-propagate :: Var -> Bool -> State -> Either Conflict State
-propagate x b s0 =
-  case IntMap.lookup x (monitored s0) of
-    Nothing  -> Right s0
-    Just cs2 -> foldM prop s0 cs2
-  where
-  prop s cid =
-    case IntMap.lookup cid (incomplete s) of
-      Nothing -> Right s
-      Just wa ->
-        case setVarInClause2 (assigned s) x b wa of
-          Complete -> Right s
-          Watched w@(Clause2 n _ _) ->
-            Right s { incomplete = IntMap.insert cid w (incomplete s)
-                    , monitored  = IntMap.insertWith (++) n [cid]
-                                 $ IntMap.adjust (List.delete cid) x
-                                 $ monitored s
-                    }
-          Singleton si -> setVarFromClause1 si s
-
-
-data SetVar2Result = Complete           -- ^ Clause was already satisifed
-                   | Watched Clause2    -- ^ The new watched clause
-                   | Singleton Clause1  -- ^ The clause became a singleton
-
--- | Update a watched clause, after a variable is assigned.
-setVarInClause2 :: Assignment -> Var -> Bool -> Clause2 -> SetVar2Result
-setVarInClause2 agn x v (Clause2 a b c)
-  | polarityOf x c v = Complete
-  | otherwise = foldr pick (Singleton (Clause1 other c)) (IntSet.toList c)
-  where
-  other = if x == a then b else a
-
-  pick l notMe
-    | v1 == x || v1 == other     = notMe
-    | Just y <- lookupVar v1 agn = if p1 y then Complete else notMe
-    | otherwise                  = Watched (Clause2 v1 other c)
-                                   -- new var is first
-      where v1 = varOf l
-            p1 = if l > 0 then id else not
-
+tripple :: a -> b -> c -> (a,b,c)
+tripple !x !y !z = (x,y,z)
 
