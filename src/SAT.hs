@@ -3,8 +3,8 @@ module SAT (check, Var(..),Polarity(..), Assignment) where
 
 import Data.Set(Set)
 import qualified Data.Set as Set
-import Data.Map(Map)
-import qualified Data.Map as Map
+import Data.Map.Strict(Map)
+import qualified Data.Map.Strict as Map
 import Data.Foldable(foldl')
 import Control.Monad(foldM)
 
@@ -95,7 +95,6 @@ tryAddWatch x c w = Map.alterF upd x w
         | c `Set.member` cs -> Nothing
         | otherwise         -> Just $! Just $! Set.insert c cs
 
-
 -- | Try to move a clause to a new watch location.
 -- Conflict and unit clauses are not moved, as well as clauses that
 -- have already become true.  Instead, they are added to the set of
@@ -103,36 +102,34 @@ tryAddWatch x c w = Map.alterF upd x w
 -- New unit clauses are added to the unit clause list.
 moveClause :: (PermState, State, Set Clause) -> Clause ->
               (PermState, State, Set Clause)
-moveClause (ps0,s0,ws) c =
-  case Map.foldrWithKey checkLit Nothing (clauseVars c) of
-    Nothing -> tripple ps0 s0 ws1 -- conflict
-    Just res -> res
-
+moveClause (ps0,s0,ws) c = findLoc Nothing (Map.toList (clauseVars c))
   where
   agn = stateAssignment s0
   wl  = stateWatch ps0
   ws1 = Set.insert c ws
 
-  checkLit x pol mb =
-    case literalValue agn x pol of
-      Just True  -> Just $! tripple ps0 s0 ws1 -- trivially true
-      Just False -> mb
-      Nothing ->
-        case tryAddWatch x c wl of
-          Just w1 -> Just $! tripple ps0 { stateWatch = w1 } s0 ws -- moved
-          Nothing ->
-            case mb of
-              Nothing -> -- unit
-                  Just $! tripple
-                            ps0
-                            s0 { stateUnit = UnitClause x pol c : stateUnit s0 }
-                            ws1
-              _ -> mb
+  findLoc mb ps =
+    case ps of
+      [] -> case mb of
+               Nothing -> ws1 `seq` (ps0,s0,ws1)
+               Just u -> let s1 = s0 { stateUnit = u : stateUnit s0 }
+                         in s1 `seq` ws1 `seq` (ps0,s1,ws1)
+      (x,pol) : more ->
+         case literalValue agn x pol of
+           Just True  -> ws1 `seq` (ps0,s0,ws1) -- trivially true
+           Just False -> findLoc mb more
+           Nothing ->
+             case tryAddWatch x c wl of
+               Just w1 -> let ps1 = ps0 { stateWatch = w1 }
+                          in ps1 `seq` (ps1, s0, ws) -- moved
+               Nothing -> findLoc (Just (UnitClause x pol c)) more
+
+
 
 -- | Set a previously unasigned variable to a given value an
 -- move around clauses as needed.
 setVar :: Var -> Bool -> PermState -> State -> (PermState,State)
-setVar !x b !ps !s =
+setVar x b ps s =
   case Map.lookup x (stateWatch ps) of
     Nothing   -> pair ps s'   -- no-one needs updates
     Just todo -> pair ps1 { stateWatch = Map.insert x ws (stateWatch ps1) }
@@ -163,11 +160,11 @@ search !ps !s prev =
         Just False -> backtrack ps prev (clauseVars c)
         Nothing    -> search ps1 s1 newTr
           where
-          newTr     = Propagate (Map.delete x (clauseVars c)) x p s prev
+          newTr     = Propagate (clauseVars c) x p s prev
           (ps1,s1)  = setVar x (p == Positive) ps s { stateUnit = us }
 
 backtrack :: PermState -> Trace -> Map Var Polarity -> Maybe Assignment
-backtrack !ps steps confl =
+backtrack ps steps confl =
   case steps of
     Initial -> Nothing
 
@@ -191,7 +188,8 @@ backtrack !ps steps confl =
 
     Propagate asmps x p _ more
       | Just p1 <- Map.lookup x confl
-      , negatePolarity p1 == p -> backtrack ps more $! Map.union asmps confl
+      , negatePolarity p1 == p ->
+          backtrack ps more $! Map.delete x $! Map.union asmps confl
       | otherwise -> backtrack ps more confl
 
 backjump :: Map Var Polarity -> State -> Trace -> (Maybe Var,State,Trace)
