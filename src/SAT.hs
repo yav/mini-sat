@@ -9,15 +9,15 @@ import Data.Foldable(foldl')
 import Control.Monad(foldM)
 
 newtype Var     = Var Int
-                  deriving (Eq,Ord,Show)
+                  deriving (Eq,Ord)
 
 data Polarity   = Negated | Positive
-                  deriving (Eq,Ord,Show)
+                  deriving (Eq,Ord)
 
 type ClauseId   = Int
 data Clause     = Clause { clauseId   :: {-# UNPACK #-} !ClauseId
                          , clauseVars ::                !(Map Var Polarity)
-                         } deriving Show
+                         }
 
 instance Eq Clause where
   c == d = clauseId c == clauseId d
@@ -26,16 +26,15 @@ instance Ord Clause where
   compare c d = compare (clauseId c) (clauseId d)
 
 data UnitClause = UnitClause !Var !Polarity !Clause
-                    deriving Show
 
 type Assignment = Map Var Bool
 
 -- | Describes how we got to the current state.
 -- Each steap contains the previous state and a trace to get it.
-data Trace      = GuessTrue !Var !State !Trace
+data Trace      = GuessTrue !Var !State Trace
                   -- ^ Variable we guessed to be true, state before guess
 
-                | Propagate !(Map Var Polarity) !Var !Polarity !State !Trace
+                | Propagate !(Map Var Polarity) !Var !Polarity !State Trace
                 | Initial
 
 type WatchList  = Map Var (Set Clause)
@@ -133,15 +132,15 @@ moveClause (ps0,s0,ws) c =
 -- | Set a previously unasigned variable to a given value an
 -- move around clauses as needed.
 setVar :: Var -> Bool -> PermState -> State -> (PermState,State)
-setVar !x !b !ps !s =
+setVar !x b !ps !s =
   case Map.lookup x (stateWatch ps) of
     Nothing   -> pair ps s'   -- no-one needs updates
     Just todo -> pair ps1 { stateWatch = Map.insert x ws (stateWatch ps1) }
                       s1
-      where (ps1,s1,ws) = foldl' moveClause (ps,s',Set.empty) todo
+      where (ps1,s1,ws) = foldl' moveClause (tripple ps s' Set.empty) todo
 
   where
-  s'       = s { stateAssignment = Map.insert x b (stateAssignment s) }
+  s' = s { stateAssignment = Map.insert x b (stateAssignment s) }
 
 pickVar :: State -> Maybe (Var,State)
 pickVar s = case dropWhile done (stateVars s) of
@@ -168,7 +167,7 @@ search !ps !s prev =
           (ps1,s1)  = setVar x (p == Positive) ps s { stateUnit = us }
 
 backtrack :: PermState -> Trace -> Map Var Polarity -> Maybe Assignment
-backtrack !ps !steps !confl =
+backtrack !ps steps confl =
   case steps of
     Initial -> Nothing
 
@@ -190,12 +189,10 @@ backtrack !ps !steps !confl =
         _ -> backtrack ps more confl
 
 
-    Propagate asmps x p _ more -> backtrack ps more newConfl
-      where
-      newConfl =
-        case Map.lookup x confl of
-          Just p1 | negatePolarity p1 == p -> Map.union asmps confl
-          _                                -> confl
+    Propagate asmps x p _ more
+      | Just p1 <- Map.lookup x confl
+      , negatePolarity p1 == p -> backtrack ps more $! Map.union asmps confl
+      | otherwise -> backtrack ps more confl
 
 backjump :: Map Var Polarity -> State -> Trace -> (Maybe Var,State,Trace)
 backjump confl s steps  =
