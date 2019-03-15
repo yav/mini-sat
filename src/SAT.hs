@@ -262,11 +262,10 @@ newClause (ps,s) c =
      let (cid,ps1) = newClauseId ps
      Just $! case IMap.minViewWithKey mp1 of
                Nothing ->
-                 pair ps1
-                      s { stateUnit = Todo (UnitClause x p c) (stateUnit s) }
-               Just ((y,_),_) -> pair (watchAt x y cid c ps1) s
+                 let s1 = s { stateUnit = Todo (UnitClause x p c) (stateUnit s)}
+                 in s1 `seq` (ps1,s1)
 
-pair :: a -> b -> (a,b)
-pair !x !y = (x,y)
-
+               Just ((y,_),_) ->
+                 let ps2 = watchAt x y cid c ps1
+                 in ps2 `seq` (ps2,s)
 
