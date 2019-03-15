@@ -1,50 +1,59 @@
 {-# Language BangPatterns #-}
-module SAT (check, Var(..),Polarity(..), Assignment) where
+module SAT (check, Clause,Polarity(..), Assignment) where
 
-import Data.Set(Set)
-import qualified Data.Set as Set
-import Data.Map.Strict(Map)
-import qualified Data.Map.Strict as Map
-import Data.Foldable(foldl')
+import Data.IntMap(IntMap)
+import qualified Data.IntMap.Strict as IMap
+import qualified Data.IntSet as ISet
 import Control.Monad(foldM)
+import Control.Applicative(empty)
 
-newtype Var     = Var Int
-                  deriving (Eq,Ord)
 
-data Polarity   = Negated | Positive
-                  deriving (Eq,Ord)
+type Var        = Int
+data Polarity   = Negated | Positive deriving (Eq)
 
+-- | A unique idnetifier for a clause.
 type ClauseId   = Int
-data Clause     = Clause { clauseId   :: {-# UNPACK #-} !ClauseId
-                         , clauseVars ::                !(Map Var Polarity)
-                         }
 
-instance Eq Clause where
-  c == d = clauseId c == clauseId d
+-- | A clause is a disjunction of literals.
+type Clause     = IntMap{-Var-} Polarity
 
-instance Ord Clause where
-  compare c d = compare (clauseId c) (clauseId d)
+-- | A collection of clauses with unique names.
+type Clauses    = IntMap{-ClauseId-} Clause
 
-data UnitClause = UnitClause !Var !Polarity !Clause
+-- | A unit clause is one where all literals except the one specifically
+-- called out are known to be false.
+data UnitClause = UnitClause {-# UNPACK #-} !Var !Polarity !Clause
 
-type Assignment = Map Var Bool
+-- | An assignment keeps track of the current values for variables.
+type Assignment = IntMap{-Var-} Bool
+
+-- | A watch list keeps track of which clauses we should check when
+-- a variable is assigned.
+type WatchList  = IntMap{-Var-} Clauses
+
 
 -- | Describes how we got to the current state.
 -- Each steap contains the previous state and a trace to get it.
-data Trace      = GuessTrue !Var !State Trace
+data Trace      = GuessTrue {-# UNPACK #-} !Var
+                            {-# UNPACK #-} !State
+                                            Trace
                   -- ^ Variable we guessed to be true, state before guess
 
-                | Propagate !(Map Var Polarity) !Var !Polarity !State Trace
+                | Propagate {-# UNPACK #-} !UnitClause
+                            {-# UNPACK #-} !State
+                                            Trace
+                  -- ^ A variable we because of the given unit clasue.
+
                 | Initial
 
-type WatchList  = Map Var (Set Clause)
-
+data PropTodo   = Todo {-# UNPACK #-} !UnitClause PropTodo
+                | NoWork
 
 
 -- | State which backtrack
 data State = State
   { stateAssignment :: !Assignment
-  , stateUnit       :: ![UnitClause]
+  , stateUnit       :: !PropTodo
   , stateVars       :: ![Var]
   }
 
@@ -56,13 +65,13 @@ data PermState = PermState
 
 
 initState :: State
-initState = State { stateAssignment = Map.empty
-                  , stateUnit       = []
+initState = State { stateAssignment = IMap.empty
+                  , stateUnit       = NoWork
                   , stateVars       = []
                   }
 
 initPermState :: PermState
-initPermState = PermState { stateWatch      = Map.empty
+initPermState = PermState { stateWatch      = IMap.empty
                           , stateNextClause = 0
                           }
 
@@ -77,7 +86,7 @@ negatePolarity p =
 -- | Compute the value of a literal under the given assignment, if any.
 literalValue :: Assignment -> Var -> Polarity -> Maybe Bool
 literalValue agn x pol =
-  do b <- Map.lookup x agn
+  do b <- IMap.lookup x agn
      pure $! case pol of
                Positive -> b
                Negated  -> not b
@@ -85,156 +94,179 @@ literalValue agn x pol =
 
 -- | Try to watch the variable of a literal from a clause.
 -- Fails if we already have an entry for this clause and this variable.
-tryAddWatch :: Var -> Clause -> WatchList -> Maybe WatchList
-tryAddWatch x c w = Map.alterF upd x w
+tryAddWatch :: Var -> ClauseId -> Clause -> WatchList -> Maybe WatchList
+tryAddWatch x cid c w = IMap.alterF upd x w
   where
   upd mb =
     case mb of
-      Nothing -> Just $! Just $! Set.singleton c
-      Just cs
-        | c `Set.member` cs -> Nothing
-        | otherwise         -> Just $! Just $! Set.insert c cs
+      Nothing -> pure $! Just $! IMap.singleton cid c
+      Just cs ->
+        case IMap.insertLookupWithKey (\_ new _ -> new) cid c cs of
+          (Nothing,cs1) -> pure $! Just $! cs1
+          (Just _,_)    -> empty
+
 
 -- | Try to move a clause to a new watch location.
 -- Conflict and unit clauses are not moved, as well as clauses that
 -- have already become true.  Instead, they are added to the set of
 -- clauses that will stay on this watch list.
 -- New unit clauses are added to the unit clause list.
-moveClause :: (PermState, State, Set Clause) -> Clause ->
-              (PermState, State, Set Clause)
-moveClause (ps0,s0,ws) c = findLoc Nothing (Map.toList (clauseVars c))
+moveClause :: Assignment -> WatchList -> ClauseId -> Clause -> PropTodo ->
+              Either (Maybe PropTodo) WatchList
+moveClause agn wl cid c us = findLoc (IMap.toList c) Nothing
   where
-  agn = stateAssignment s0
-  wl  = stateWatch ps0
-  ws1 = Set.insert c ws
-
-  findLoc mb ps =
+  findLoc ps =
     case ps of
-      [] -> case mb of
-               Nothing -> ws1 `seq` (ps0,s0,ws1)
-               Just u -> let s1 = s0 { stateUnit = u : stateUnit s0 }
-                         in s1 `seq` ws1 `seq` (ps0,s1,ws1)
+      [] -> \mb -> case mb of
+                     Nothing -> Left Nothing
+                     Just u  -> Left (Just (Todo u us))
       (x,pol) : more ->
          case literalValue agn x pol of
-           Just True  -> ws1 `seq` (ps0,s0,ws1) -- trivially true
-           Just False -> findLoc mb more
-           Nothing ->
-             case tryAddWatch x c wl of
-               Just w1 -> let ps1 = ps0 { stateWatch = w1 }
-                          in ps1 `seq` (ps1, s0, ws) -- moved
-               Nothing -> findLoc (Just (UnitClause x pol c)) more
+           Just True  -> \_ -> Left Nothing
+           Just False -> findLoc more
+           Nothing -> \_ ->
+             case tryAddWatch x cid c wl of
+               Just w1 -> Right w1
+               Nothing -> let u = Just $! UnitClause x pol c
+                          in u `seq` findLoc more u
 
+
+-- | Start monitoring different variables of the clauses after assigning
+-- the given variable.  Also computes any new unit clauses.
+moveClauses ::
+  Assignment -> Var -> WatchList -> PropTodo -> (PropTodo,WatchList)
+moveClauses agn x wl0 us0 =
+  case IMap.lookup x wl0 of
+    Nothing   -> (us0, wl0)
+    Just todo -> go IMap.empty us0 wl0 (IMap.toList todo)
+  where
+  go stay us wl todo =
+    case todo of
+      [] -> let newWs = IMap.insert x stay wl
+            in newWs `seq` (us,newWs)
+      (cid,c) : more ->
+         case moveClause agn wl cid c us of
+           Right wl1 -> go stay us wl1 more
+           Left mb   ->
+             let stay1 = IMap.insert cid c stay
+             in case mb of
+                  Nothing  -> stay1 `seq` go stay1 us  wl more
+                  Just us1 -> stay1 `seq` go stay1 us1 wl more
 
 
 -- | Set a previously unasigned variable to a given value an
 -- move around clauses as needed.
 setVar :: Var -> Bool -> PermState -> State -> (PermState,State)
-setVar x b ps s =
-  case Map.lookup x (stateWatch ps) of
-    Nothing   -> pair ps s'   -- no-one needs updates
-    Just todo -> pair ps1 { stateWatch = Map.insert x ws (stateWatch ps1) }
-                      s1
-      where (ps1,s1,ws) = foldl' moveClause (tripple ps s' Set.empty) todo
+setVar x b !ps !s =
+  let agn      = IMap.insert x b (stateAssignment s)
+      (us,ws1) = agn `seq` moveClauses agn x (stateWatch ps) (stateUnit s)
+      ps1      = ps { stateWatch = ws1 }
+      s1       = s  { stateAssignment = agn, stateUnit = us }
+  in ps1 `seq` s1 `seq` (ps1,s1)
+{-# INLINE setVar #-}
 
-  where
-  s' = s { stateAssignment = Map.insert x b (stateAssignment s) }
+
 
 pickVar :: State -> Maybe (Var,State)
 pickVar s = case dropWhile done (stateVars s) of
               []     -> Nothing
               x : xs -> Just (x, s { stateVars = xs })
-  where done x = x `Map.member` stateAssignment s
+  where done x = IMap.member x (stateAssignment s)
 
 search :: PermState -> State -> Trace -> Maybe Assignment
-search !ps !s prev =
+search !ps s prev =
   case stateUnit s of
 
-    [] -> case pickVar s of
-            Nothing     -> Just (stateAssignment s)
-            Just (x,s1) ->  search ps1 s2 (GuessTrue x s prev)
-              where (ps1,s2) = setVar x True ps s1
+    NoWork -> case pickVar s of
+                Nothing     -> Just $! stateAssignment s
+                Just (x,s1) -> search ps1 s2 (GuessTrue x s prev)
+                  where (ps1,s2) = setVar x True ps s1
 
-    UnitClause x p c : us ->
+    Todo u@(UnitClause x p c) us ->
       case literalValue (stateAssignment s) x p of
         Just True  -> search ps s { stateUnit = us } prev
-        Just False -> backtrack ps prev (clauseVars c)
-        Nothing    -> search ps1 s1 newTr
-          where
-          newTr     = Propagate (clauseVars c) x p s prev
-          (ps1,s1)  = setVar x (p == Positive) ps s { stateUnit = us }
+        Just False -> backtrack ps prev c
+        Nothing    -> search ps1 s1 (Propagate u s prev)
+          where (ps1,s1) = b `seq` setVar x b ps s { stateUnit = us }
+                b        = p == Positive
 
-backtrack :: PermState -> Trace -> Map Var Polarity -> Maybe Assignment
+
+backtrack :: PermState -> Trace -> Clause -> Maybe Assignment
 backtrack ps steps confl =
   case steps of
     Initial -> Nothing
 
     GuessTrue x s more ->
 
-      case Map.lookup x confl of
-        Just Negated ->
-          case mbY of
-            Nothing -> search ps1 s2 more'
-            Just y  -> search (watchAt x y c ps1) s2 more'
-
+      case IMap.lookup x confl of
+        Just Negated -> backjumpK k confl s more
           where
-          s2             = s1 { stateUnit = UnitClause x Negated c
-                                          : stateUnit s1 }
-          (mbY,s1,more') = backjump confl s more
-          (c,ps1)        = newFreeClause ps (negatePolarity <$> confl)
-                                                      -- learned clause
+          k mbY !s1 more' =
+            case mbY of
+              Nothing -> search ps1 s2 more'
+              Just y  -> let ps2 = watchAt x y cid c ps1
+                          in ps2 `seq` search ps2 s2 more'
+
+            where
+            s2             = s1 { stateUnit = Todo (UnitClause x Negated c)
+                                                   (stateUnit s1) }
+            (cid,ps1)      = newClauseId ps
+            c              = IMap.map negatePolarity confl -- learned clause
 
         _ -> backtrack ps more confl
 
-
-    Propagate asmps x p _ more
-      | Just p1 <- Map.lookup x confl
+    Propagate (UnitClause x p asmps) _ more
+      | Just p1 <- IMap.lookup x confl
       , negatePolarity p1 == p ->
-          backtrack ps more $! Map.delete x $! Map.union asmps confl
+          backtrack ps more $! IMap.delete x $! IMap.union asmps confl
       | otherwise -> backtrack ps more confl
 
-backjump :: Map Var Polarity -> State -> Trace -> (Maybe Var,State,Trace)
-backjump confl s steps  =
-  case steps of
-    GuessTrue x s1 more
-      | not (x `Map.member` confl) -> backjump confl s1 more
-      | otherwise -> (Just x,s,steps)
 
-    Propagate _ x _ s1 more
-      | not (x `Map.member` confl) -> backjump confl s1 more
-      | otherwise -> (Just x,s,steps)
+backjumpK :: (Maybe Var -> State -> Trace -> a) ->
+             Clause -> State -> Trace -> a
+backjumpK k = go
+  where
+  go confl !s steps  =
+    case steps of
+      GuessTrue x s1 more
+        | not (x `IMap.member` confl) -> go confl s1 more
+        | otherwise -> k (Just x) s steps
 
-    Initial -> (Nothing,s,steps)
+      Propagate (UnitClause x _ _) s1 more
+        | not (x `IMap.member` confl) -> go confl s1 more
+        | otherwise -> k (Just x) s steps
+
+      Initial -> k Nothing s steps
 
 
-check :: [Map Var Polarity] -> Maybe Assignment
+
+check :: [Clause] -> Maybe Assignment
 check cs =
   do (ps,s) <- foldM newClause (initPermState,s0) cs
      search ps s Initial
   where
-  s0 = initState { stateVars = Set.toList (Set.unions (map Map.keysSet cs)) }
+  s0 = initState { stateVars = ISet.toList (ISet.unions (map IMap.keysSet cs)) }
 
-newFreeClause :: PermState -> Map Var Polarity -> (Clause, PermState)
-newFreeClause s lits = pair c s1
+newClauseId :: PermState -> (ClauseId, PermState)
+newClauseId s = s1 `seq` (n, s1)
   where n  = stateNextClause s
-        c  = Clause { clauseId = n, clauseVars = lits }
         s1 = s { stateNextClause = n + 1 }
 
-watchAt :: Var -> Var -> Clause -> PermState -> PermState
-watchAt x y c s = s { stateWatch = add x $ add y $ stateWatch s }
-  where add v = Map.insertWith Set.union v $! Set.singleton c
+watchAt :: Var -> Var -> ClauseId -> Clause -> PermState -> PermState
+watchAt x y cid c s = s { stateWatch = add x $ add y $ stateWatch s }
+  where add v = IMap.insertWith IMap.union v $! IMap.singleton cid c
 
-newClause :: (PermState,State) -> Map Var Polarity -> Maybe (PermState, State)
-newClause (ps,s) lits =
-  do ((x,p),mp1) <- Map.minViewWithKey lits
-     let (c,ps1) = newFreeClause ps lits
-     Just $! case Map.minViewWithKey mp1 of
+newClause :: (PermState,State) -> Clause -> Maybe (PermState, State)
+newClause (ps,s) c =
+  do ((x,p),mp1) <- IMap.minViewWithKey c
+     let (cid,ps1) = newClauseId ps
+     Just $! case IMap.minViewWithKey mp1 of
                Nothing ->
-                 pair ps1 s { stateUnit = UnitClause x p c : stateUnit s }
-               Just ((y,_),_) -> pair (watchAt x y c ps1) s
+                 pair ps1
+                      s { stateUnit = Todo (UnitClause x p c) (stateUnit s) }
+               Just ((y,_),_) -> pair (watchAt x y cid c ps1) s
 
 pair :: a -> b -> (a,b)
 pair !x !y = (x,y)
 
-tripple :: a -> b -> c -> (a,b,c)
-tripple !x !y !z = (x,y,z)
 
