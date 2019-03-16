@@ -33,19 +33,15 @@ type WatchList  = IntMap{-Var-} Clauses
 
 -- | Describes how we got to the current state.
 -- Each steap contains the previous state and a trace to get it.
-data Trace      = GuessTrue {-# UNPACK #-} !Var
-                            {-# UNPACK #-} !State
-                                            Trace
+data Trace      = GuessTrue {-# UNPACK #-} !Var !State Trace
                   -- ^ Variable we guessed to be true, state before guess
 
-                | Propagate {-# UNPACK #-} !UnitClause
-                            {-# UNPACK #-} !State
-                                            Trace
+                | Propagate !UnitClause !State Trace
                   -- ^ A variable we because of the given unit clasue.
 
                 | Initial
 
-data PropTodo   = Todo {-# UNPACK #-} !UnitClause PropTodo
+data PropTodo   = Todo !UnitClause PropTodo
                 | NoWork
 
 
