@@ -7,7 +7,6 @@ import qualified Data.IntSet as ISet
 import Control.Monad(foldM)
 import Control.Applicative(empty)
 
-
 type Var        = Int
 data Polarity   = Negated | Positive deriving (Eq)
 
@@ -115,16 +114,16 @@ moveClause :: Assignment -> WatchList -> ClauseId -> Clause -> PropTodo ->
               Either (Maybe PropTodo) WatchList
 moveClause agn wl cid c us = findLoc (IMap.toList c) Nothing
   where
-  findLoc ps =
+  findLoc ps mb =
     case ps of
-      [] -> \mb -> case mb of
-                     Nothing -> Left Nothing
-                     Just u  -> Left (Just (Todo u us))
+      [] -> case mb of
+              Nothing -> Left Nothing
+              Just u  -> Left (Just (Todo u us))
       (x,pol) : more ->
          case literalValue agn x pol of
-           Just True  -> \_ -> Left Nothing
-           Just False -> findLoc more
-           Nothing -> \_ ->
+           Just True  -> Left Nothing
+           Just False -> findLoc more mb
+           Nothing ->
              case tryAddWatch x cid c wl of
                Just w1 -> Right w1
                Nothing -> let u = Just $! UnitClause x pol c
@@ -190,7 +189,6 @@ search !ps s prev =
           where (ps1,s1) = b `seq` setVar x b ps s { stateUnit = us }
                 b        = p == Positive
 
-
 backtrack :: PermState -> Trace -> Clause -> Maybe Assignment
 backtrack ps steps confl =
   case steps of
@@ -204,14 +202,12 @@ backtrack ps steps confl =
           k mbY !s1 more' =
             case mbY of
               Nothing -> search ps1 s2 more'
-              Just y  -> let ps2 = watchAt x y cid c ps1
+              Just y  -> let ps2 = watchAt x y cid confl ps1
                           in ps2 `seq` search ps2 s2 more'
-
             where
-            s2             = s1 { stateUnit = Todo (UnitClause x Negated c)
-                                                   (stateUnit s1) }
-            (cid,ps1)      = newClauseId ps
-            c              = IMap.map negatePolarity confl -- learned clause
+            (cid,ps1) = newClauseId ps
+            s2 = s1 { stateUnit = Todo (UnitClause x Negated confl)
+                                                                (stateUnit s1) }
 
         _ -> backtrack ps more confl
 
@@ -268,4 +264,29 @@ newClause (ps,s) c =
                Just ((y,_),_) ->
                  let ps2 = watchAt x y cid c ps1
                  in ps2 `seq` (ps2,s)
+
+--------------------------------------------------------------------------------
+
+
+showLit :: Var -> Polarity -> String
+showLit x p = shP ++ show x
+  where shP = case p of
+                Positive -> "+"
+                Negated  -> "-"
+
+showClause :: Clause -> String
+showClause = unwords . map (uncurry showLit) . IMap.toList
+
+checkUnit :: Assignment -> UnitClause -> UnitClause
+checkUnit agn u@(UnitClause x _ c)
+  | null bad = u
+  | otherwise = error ("Invalid unit clause: " ++ unwords bad)
+  where
+  bad = [ showLit v p ++ " = " ++ show val ++ ";" | (v,p) <- IMap.toList c
+        , v /= x
+        , let val = literalValue agn v p
+        , val /= Just False ]
+
+
+
 
