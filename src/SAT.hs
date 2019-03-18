@@ -1,4 +1,3 @@
-{-# Language BangPatterns #-}
 module SAT (check, Clause,Polarity(..), Assignment) where
 
 import Data.IntMap(IntMap)
@@ -6,6 +5,7 @@ import qualified Data.IntMap.Strict as IMap
 import qualified Data.IntSet as ISet
 import Control.Monad(foldM)
 import Control.Applicative(empty)
+
 
 type Var        = Int
 data Polarity   = Negated | Positive deriving (Eq)
@@ -152,7 +152,7 @@ moveClauses agn x wl0 us0 =
 -- | Set a previously unasigned variable to a given value an
 -- move around clauses as needed.
 setVar :: Var -> Bool -> PermState -> State -> (PermState,State)
-setVar x b !ps !s =
+setVar x b ps s =
   let agn      = IMap.insert x b (stateAssignment s)
       (us,ws1) = agn `seq` moveClauses agn x (stateWatch ps) (stateUnit s)
       ps1      = ps { stateWatch = ws1 }
@@ -169,7 +169,7 @@ pickVar s = case dropWhile done (stateVars s) of
   where done x = IMap.member x (stateAssignment s)
 
 search :: PermState -> State -> Trace -> Maybe Assignment
-search !ps s prev =
+search ps s prev =
   case stateUnit s of
 
     NoWork -> case pickVar s of
@@ -193,17 +193,16 @@ backtrack ps steps confl =
     GuessTrue x s more ->
 
       case IMap.lookup x confl of
-        Just Negated -> backjumpK k confl s more
+        Just Negated ->
+          case mbY of
+            Nothing -> search ps1 s2 more'
+            Just y  -> let ps2 = watchAt x y cid confl ps1
+                        in ps2 `seq` search ps2 s2 more'
           where
-          k mbY !s1 more' =
-            case mbY of
-              Nothing -> search ps1 s2 more'
-              Just y  -> let ps2 = watchAt x y cid confl ps1
-                          in ps2 `seq` search ps2 s2 more'
-            where
-            (cid,ps1) = newClauseId ps
-            s2 = s1 { stateUnit = Todo (UnitClause x Negated confl)
-                                                                (stateUnit s1) }
+          (cid,ps1)      = newClauseId ps
+          (mbY,s1,more') = backjump confl s more
+          s2             = s1 { stateUnit = Todo (UnitClause x Negated confl)
+                                                 (stateUnit s1) }
 
         _ -> backtrack ps more confl
 
@@ -214,21 +213,20 @@ backtrack ps steps confl =
       | otherwise -> backtrack ps more confl
 
 
-backjumpK :: (Maybe Var -> State -> Trace -> a) ->
-             Clause -> State -> Trace -> a
-backjumpK k = go
+backjump :: Clause -> State -> Trace -> (Maybe Var,State,Trace)
+backjump confl = go
   where
-  go confl !s steps  =
+  go s steps  =
     case steps of
       GuessTrue x s1 more
-        | not (x `IMap.member` confl) -> go confl s1 more
-        | otherwise -> k (Just x) s steps
+        | not (x `IMap.member` confl) -> go s1 more
+        | otherwise -> (Just x, s, steps)
 
       Propagate (UnitClause x _ _) s1 more
-        | not (x `IMap.member` confl) -> go confl s1 more
-        | otherwise -> k (Just x) s steps
+        | not (x `IMap.member` confl) -> go s1 more
+        | otherwise -> (Just x, s, steps)
 
-      Initial -> k Nothing s steps
+      Initial -> (Nothing, s, steps)
 
 
 
