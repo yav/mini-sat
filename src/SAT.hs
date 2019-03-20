@@ -5,6 +5,11 @@ import qualified Data.IntMap.Strict as IMap
 import qualified Data.IntSet as ISet
 import Control.Monad(foldM)
 import Control.Applicative(empty)
+import Data.Foldable(foldl')
+import Data.List(sortBy)
+import Data.Function(on)
+
+import Debug.Trace
 
 
 type Var        = Int
@@ -16,12 +21,19 @@ type ClauseId   = Int
 -- | A clause is a disjunction of literals.
 type Clause     = IntMap{-Var-} Polarity
 
+data AnnotClause = AnnotClause
+  { clauseVars    :: !Clause
+  , clauseLearned :: !(Maybe Int)
+    -- ^ If learned, then at what time was it born.
+  }
+
 -- | A collection of clauses with unique names.
-type Clauses    = IntMap{-ClauseId-} Clause
+type Clauses    = IntMap{-ClauseId-} AnnotClause
 
 -- | A unit clause is one where all literals except the one specifically
 -- called out are known to be false.
-data UnitClause = UnitClause {-# UNPACK #-} !Var !Polarity !Clause
+data UnitClause = UnitClause {-# UNPACK #-} !Var !Polarity
+                             {-# UNPACK #-} !ClauseId !Clause
 
 -- | An assignment keeps track of the current values for variables.
 type Assignment = IntMap{-Var-} Bool
@@ -56,6 +68,11 @@ data State = State
 data PermState = PermState
   { stateNextClause :: !Int
   , stateWatch      :: !WatchList
+  , learnCount      :: !Int
+  , clauseUseCount  :: !(IntMap{-ClauseId-} Int)
+  , varUseCount     :: !(IntMap{-Var-} Int)
+  , varOrd          :: ![Var]
+  , restartCount    :: !Int
   }
 
 
@@ -68,6 +85,11 @@ initState = State { stateAssignment = IMap.empty
 initPermState :: PermState
 initPermState = PermState { stateWatch      = IMap.empty
                           , stateNextClause = 0
+                          , learnCount      = 0
+                          , clauseUseCount  = IMap.empty
+                          , varUseCount     = IMap.empty
+                          , varOrd          = []
+                          , restartCount    = 1000
                           }
 
 
@@ -89,7 +111,7 @@ literalValue agn x pol =
 
 -- | Try to watch the variable of a literal from a clause.
 -- Fails if we already have an entry for this clause and this variable.
-tryAddWatch :: Var -> ClauseId -> Clause -> WatchList -> Maybe WatchList
+tryAddWatch :: Var -> ClauseId -> AnnotClause -> WatchList -> Maybe WatchList
 tryAddWatch x cid c w = IMap.alterF upd x w
   where
   upd mb =
@@ -106,9 +128,9 @@ tryAddWatch x cid c w = IMap.alterF upd x w
 -- have already become true.  Instead, they are added to the set of
 -- clauses that will stay on this watch list.
 -- New unit clauses are added to the unit clause list.
-moveClause :: Assignment -> WatchList -> ClauseId -> Clause -> PropTodo ->
+moveClause :: Assignment -> WatchList -> ClauseId -> AnnotClause -> PropTodo ->
               Either (Maybe PropTodo) WatchList
-moveClause agn wl cid c us = findLoc (IMap.toList c) Nothing
+moveClause agn wl cid c us = findLoc (IMap.toList (clauseVars c)) Nothing
   where
   findLoc ps mb =
     case ps of
@@ -122,7 +144,7 @@ moveClause agn wl cid c us = findLoc (IMap.toList c) Nothing
            Nothing ->
              case tryAddWatch x cid c wl of
                Just w1 -> Right w1
-               Nothing -> let u = Just $! UnitClause x pol c
+               Nothing -> let u = Just $! UnitClause x pol cid $! clauseVars c
                           in u `seq` findLoc more u
 
 
@@ -168,27 +190,89 @@ pickVar s = case dropWhile done (stateVars s) of
               x : xs -> Just (x, s { stateVars = xs })
   where done x = IMap.member x (stateAssignment s)
 
+bumpClauseUseCount :: ClauseId -> PermState -> PermState
+bumpClauseUseCount cid ps =
+  ps { clauseUseCount = IMap.insertWith (+) cid 1 (clauseUseCount ps) }
+
+bumpVarUseCount :: Clause -> PermState -> PermState
+bumpVarUseCount confl ps =
+  ps { varUseCount = IMap.unionWith (+) new (varUseCount ps) }
+  where
+  new = IMap.map (const 1) confl
+
+debugEnd :: PermState -> a -> a
+debugEnd ps a =
+  trace ("Learned clauses:\n" ++ show (learnCount ps)) $
+  trace ("UsedClauses:") $
+  trace (unlines $ map show $ IMap.toList learnC) $
+  trace ("VarUses:") $
+  trace (show (newVarOrder ps)) a
+  where
+  learnC = foldl' addClauses IMap.empty (stateWatch ps)
+  addClauses mp is = IMap.foldlWithKey' addClause mp is
+  addClause mp cid an =
+    case clauseLearned an of
+      Nothing -> mp
+      Just born ->
+        let life = learnCount ps - born
+            uses = IMap.findWithDefault 0 cid (clauseUseCount ps)
+        in life `seq` IMap.insert cid (uses,life) mp
+
+newVarOrder :: PermState -> [Var]
+newVarOrder ps = map fst
+               $ sortBy (compare `on` snd)
+               $ IMap.toList
+               $ IMap.unionWith max (varUseCount ps) dfltMap
+  where
+  dfltMap = IMap.fromList [ (v,negate i) | (v,i) <- varOrd ps `zip` [ 0 .. ] ]
+
+forgetLearned :: PermState -> WatchList
+forgetLearned ps = IMap.map (IMap.filterWithKey keep) (stateWatch ps)
+  where
+  keep cid an = case clauseLearned an of
+                  Nothing   -> True
+                  Just born ->
+                    case IMap.lookup cid (clauseUseCount ps) of
+                      Just n  -> n > 5 || (learnCount ps - born < 200)
+                      Nothing -> False -- ?
+
+restart :: PermState -> State -> Trace -> Maybe Assignment
+restart ps sFin tFin = trace "RESTARTING" $ search ps1 s1 Initial
+  where
+  s0       = back sFin tFin
+  ps1      = ps { stateWatch = forgetLearned ps
+                , varOrd = newVarOrder ps
+                , restartCount = 2 * restartCount ps
+                }
+  s1       = s0 { stateVars = varOrd ps1 }
+
+  back s t = case t of
+               Initial -> s
+               GuessTrue _ s1 t1 -> back s1 t1
+               Propagate _ s1 t1 -> back s1 t1
+
+
 search :: PermState -> State -> Trace -> Maybe Assignment
 search ps s prev =
   case stateUnit s of
 
     NoWork -> case pickVar s of
-                Nothing     -> Just $! stateAssignment s
+                Nothing     -> debugEnd ps $! Just $! stateAssignment s
                 Just (x,s1) -> search ps1 s2 (GuessTrue x s prev)
                   where (ps1,s2) = setVar x True ps s1
 
-    Todo u@(UnitClause x p c) us ->
+    Todo u@(UnitClause x p cid c) us ->
       case literalValue (stateAssignment s) x p of
         Just True  -> search ps s { stateUnit = us } prev
-        Just False -> backtrack ps prev c
-        Nothing    -> search ps1 s1 (Propagate u s prev)
+        Just False -> backtrack (bumpClauseUseCount cid ps) prev c
+        Nothing -> search (bumpClauseUseCount cid ps1) s1 (Propagate u s prev)
           where (ps1,s1) = b `seq` setVar x b ps s { stateUnit = us }
                 b        = p == Positive
 
 backtrack :: PermState -> Trace -> Clause -> Maybe Assignment
 backtrack ps steps confl =
   case steps of
-    Initial -> Nothing
+    Initial -> debugEnd ps Nothing
 
     GuessTrue x s more ->
 
@@ -196,17 +280,27 @@ backtrack ps steps confl =
         Just Negated ->
           case mbY of
             Nothing -> search ps1 s2 more'
-            Just y  -> let ps2 = watchAt x y cid confl ps1
-                        in ps2 `seq` search ps2 s2 more'
+            Just y  -> let ac = AnnotClause
+                                  { clauseVars    = confl
+                                  , clauseLearned = Just (learnCount ps1)
+                                  }
+                           ps2 = ac `seq` watchAt x y cid ac ps1
+                           newLearnCount = learnCount ps2 + 1
+                           ps3 = bumpVarUseCount confl
+                                        ps2 { learnCount = newLearnCount }
+                       in if True {-newLearnCount < restartCount ps3-}
+                              then ps3 `seq` search ps3 s2 more'
+                              else restart ps3 s2 more'
           where
           (cid,ps1)      = newClauseId ps
           (mbY,s1,more') = backjump confl s more
-          s2             = s1 { stateUnit = Todo (UnitClause x Negated confl)
-                                                 (stateUnit s1) }
+          s2             = s1 { stateUnit = Todo
+                                              (UnitClause x Negated cid confl)
+                                              (stateUnit s1) }
 
         _ -> backtrack ps more confl
 
-    Propagate (UnitClause x p asmps) _ more
+    Propagate (UnitClause x p _ asmps) _ more
       | Just p1 <- IMap.lookup x confl
       , negatePolarity p1 == p ->
           backtrack ps more $! IMap.delete x $! IMap.union asmps confl
@@ -222,7 +316,7 @@ backjump confl = go
         | not (x `IMap.member` confl) -> go s1 more
         | otherwise -> (Just x, s, steps)
 
-      Propagate (UnitClause x _ _) s1 more
+      Propagate (UnitClause x _ _ _) s1 more
         | not (x `IMap.member` confl) -> go s1 more
         | otherwise -> (Just x, s, steps)
 
@@ -232,17 +326,19 @@ backjump confl = go
 
 check :: [Clause] -> Maybe Assignment
 check cs =
-  do (ps,s) <- foldM newClause (initPermState,s0) cs
+  do (ps,s) <- foldM newClause (ps0,s0) cs
      search ps s Initial
   where
-  s0 = initState { stateVars = ISet.toList (ISet.unions (map IMap.keysSet cs)) }
+  vs  = ISet.toList (ISet.unions (map IMap.keysSet cs))
+  s0  = initState { stateVars = vs }
+  ps0 = initPermState { varOrd = vs }
 
 newClauseId :: PermState -> (ClauseId, PermState)
 newClauseId s = s1 `seq` (n, s1)
   where n  = stateNextClause s
         s1 = s { stateNextClause = n + 1 }
 
-watchAt :: Var -> Var -> ClauseId -> Clause -> PermState -> PermState
+watchAt :: Var -> Var -> ClauseId -> AnnotClause -> PermState -> PermState
 watchAt x y cid c s = s { stateWatch = add x $ add y $ stateWatch s }
   where add v = IMap.insertWith IMap.union v $! IMap.singleton cid c
 
@@ -252,35 +348,14 @@ newClause (ps,s) c =
      let (cid,ps1) = newClauseId ps
      Just $! case IMap.minViewWithKey mp1 of
                Nothing ->
-                 let s1 = s { stateUnit = Todo (UnitClause x p c) (stateUnit s)}
+                 let s1 = s { stateUnit = Todo (UnitClause x p cid c)
+                                               (stateUnit s)}
                  in s1 `seq` (ps1,s1)
 
                Just ((y,_),_) ->
-                 let ps2 = watchAt x y cid c ps1
+                 let ac  = AnnotClause { clauseVars = c
+                                       , clauseLearned = Nothing
+                                       }
+                     ps2 = ac `seq` watchAt x y cid ac ps1
                  in ps2 `seq` (ps2,s)
-
---------------------------------------------------------------------------------
-
-
-showLit :: Var -> Polarity -> String
-showLit x p = shP ++ show x
-  where shP = case p of
-                Positive -> "+"
-                Negated  -> "-"
-
-showClause :: Clause -> String
-showClause = unwords . map (uncurry showLit) . IMap.toList
-
-checkUnit :: Assignment -> UnitClause -> UnitClause
-checkUnit agn u@(UnitClause x _ c)
-  | null bad = u
-  | otherwise = error ("Invalid unit clause: " ++ unwords bad)
-  where
-  bad = [ showLit v p ++ " = " ++ show val ++ ";" | (v,p) <- IMap.toList c
-        , v /= x
-        , let val = literalValue agn v p
-        , val /= Just False ]
-
-
-
 
